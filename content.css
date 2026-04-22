@@ -1,0 +1,48 @@
+/* 译文块容器 */
+.bilingual-block {
+  display: block;
+  margin-top: 4px;
+  padding-left: 8px;
+  border-left: 2px solid #f0597a;
+  line-height: 1.65;
+}
+
+/* 译文文字 */
+.bilingual-text {
+  display: block;
+  color: #555;
+  font-size: 0.88em;
+  font-family: inherit;
+  font-weight: normal;
+  font-style: normal;
+  letter-spacing: normal;
+}
+
+/* loading 动画 */
+.bilingual-loading {
+  display: inline-block;
+  margin-top: 4px;
+  margin-left: 8px;
+  width: 24px;
+  height: 12px;
+  background: linear-gradient(90deg, #f0597a33 25%, #f0597a99 50%, #f0597a33 75%);
+  background-size: 200% 100%;
+  animation: bilingual-shimmer 1.2s infinite;
+  border-radius: 3px;
+  vertical-align: middle;
+}
+
+@keyframes bilingual-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* 深色模式适配 */
+@media (prefers-color-scheme: dark) {
+  .bilingual-text {
+    color: #aaa;
+  }
+  .bilingual-block {
+    border-left-color: #f0597aaa;
+  }
+}

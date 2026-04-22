@@ -1,0 +1,285 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  width: 320px;
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue', sans-serif;
+  font-size: 13px;
+  background: #fff;
+  color: #222;
+}
+
+.app {
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* ── 顶部标题栏 ── */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.logo-icon {
+  width: 28px;
+  height: 28px;
+  background: #f0597a;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.logo-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: #111;
+}
+
+.version {
+  font-size: 11px;
+  color: #aaa;
+}
+
+/* ── 语言行 ── */
+.lang-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #f5f5f5;
+  border-radius: 10px;
+  padding: 8px 12px;
+}
+
+.lang-badge {
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: #555;
+  white-space: nowrap;
+}
+
+.lang-arrow {
+  color: #aaa;
+  font-size: 14px;
+}
+
+.lang-select {
+  flex: 1;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: #333;
+  cursor: pointer;
+  appearance: auto;
+  outline: none;
+}
+
+.lang-select:focus {
+  border-color: #f0597a;
+}
+
+/* ── 设置行 ── */
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px;
+}
+
+.setting-label {
+  color: #666;
+  font-size: 13px;
+}
+
+.setting-select {
+  background: #f5f5f5;
+  border: none;
+  border-radius: 7px;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: #333;
+  cursor: pointer;
+  outline: none;
+}
+
+.setting-select:hover {
+  background: #ebebeb;
+}
+
+/* ── 翻译按钮 ── */
+.translate-btn {
+  width: 100%;
+  background: #f0597a;
+  color: #fff;
+  border: none;
+  border-radius: 12px;
+  padding: 12px 16px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  transition: background 0.15s, transform 0.1s;
+  letter-spacing: 0.5px;
+}
+
+.translate-btn:hover {
+  background: #e04060;
+}
+
+.translate-btn:active {
+  transform: scale(0.98);
+}
+
+.translate-btn:disabled {
+  background: #f5a0b0;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* 停止状态：橙红色，提示可点击停止 */
+.translate-btn.translate-btn-stop {
+  background: #e05540;
+}
+
+.translate-btn.translate-btn-stop:hover {
+  background: #cc4a36;
+}
+
+.shortcut {
+  background: rgba(255,255,255,0.25);
+  border-radius: 5px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-family: monospace;
+  font-weight: normal;
+}
+
+/* ── 进度条 ── */
+.progress-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.progress-wrap.hidden {
+  display: none;
+}
+
+.progress-bar {
+  flex: 1;
+  height: 4px;
+  background: #eee;
+  border-radius: 2px;
+  overflow: hidden;
+  position: relative;
+}
+
+.progress-bar::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  width: var(--pct, 0%);
+  background: #f0597a;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  font-size: 11px;
+  color: #999;
+  white-space: nowrap;
+}
+
+/* ── 状态提示 ── */
+.status-msg {
+  font-size: 12px;
+  color: #888;
+  text-align: center;
+  padding: 2px 0;
+}
+
+.status-msg.hidden {
+  display: none;
+}
+
+.status-msg.error {
+  color: #e04060;
+}
+
+.status-msg.success {
+  color: #44aa77;
+}
+
+/* ── 快捷操作 ── */
+.quick-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.quick-label {
+  font-size: 11px;
+  color: #bbb;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.quick-btns {
+  display: flex;
+  gap: 8px;
+}
+
+.quick-btn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  background: #f8f8f8;
+  border: 1px solid #eee;
+  border-radius: 10px;
+  padding: 10px 8px;
+  cursor: pointer;
+  font-size: 11px;
+  color: #555;
+  transition: background 0.12s;
+}
+
+.quick-btn:hover {
+  background: #f0f0f0;
+}
+
+.quick-btn:active {
+  background: #e8e8e8;
+}
+
+.qicon {
+  font-size: 16px;
+  line-height: 1;
+}
