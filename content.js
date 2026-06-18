@@ -15,8 +15,11 @@ const BLOCK_TAGS = new Set([
 ]);
 
 // 排除这些容器标签内的元素
-const EXCLUDED_TAGS = new Set(['nav', 'header', 'footer', 'script', 'style', 'button',
+const EXCLUDED_TAGS = new Set(['nav', 'header', 'footer', 'aside', 'script', 'style', 'button',
   'input', 'textarea', 'select', 'code', 'pre', 'noscript']);
+
+// 提取文本时跳过这些子节点（避免广告位的 script 源码被当成正文）
+const TEXT_SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE']);
 
 // 排除这些 id 对应的区域（如 archive.md 顶部工具栏、分享弹窗）
 const EXCLUDED_IDS = new Set(['HEADER', 'DIVSHARE']);
@@ -54,12 +57,32 @@ function isMostlyChinese(text) {
 // 判断 div 是否为叶子文本容器（不含可见块级子元素）
 function isLeafDiv(el) {
   for (const child of el.children) {
+    // 子树含 script/style 的 div 多半是广告/嵌入位，跳过
+    if (TEXT_SKIP_TAGS.has(child.tagName) || child.querySelector('script, style, noscript, template')) return false;
     // display:none 的子元素不算（经济学人广告占位 div）
     const cs = window.getComputedStyle(child);
     if (cs.display === 'none' || cs.visibility === 'hidden') continue;
     if (BLOCK_TAGS.has(child.tagName.toLowerCase())) return false;
   }
   return true;
+}
+
+// 提取元素的可见文本（跳过 script/style 等）
+function getVisibleText(el) {
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      let p = node.parentElement;
+      while (p && p !== el) {
+        if (TEXT_SKIP_TAGS.has(p.tagName)) return NodeFilter.FILTER_REJECT;
+        p = p.parentElement;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  let out = '';
+  let node;
+  while ((node = walker.nextNode())) out += node.nodeValue;
+  return out.trim().replace(/\s+/g, ' ');
 }
 
 function getTranslatableElements() {
@@ -72,7 +95,7 @@ function getTranslatableElements() {
     if (el.closest('.bilingual-block')) return;
     if (isInExcluded(el)) return;
 
-    const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+    const text = getVisibleText(el);
     if (text.length < MIN_LENGTH) return;
     if (isMostlyChinese(text)) return;
 
@@ -109,16 +132,28 @@ function applyTranslation(el, text) {
     return;
   }
 
-  const block = document.createElement('span');
+  const block = document.createElement('div');
   block.className = 'bilingual-block';
   block.setAttribute('aria-label', '译文');
+  // 译文字号跟随原文
+  block.style.fontSize = window.getComputedStyle(el).fontSize;
 
-  const span = document.createElement('span');
+  const span = document.createElement('div');
   span.className = 'bilingual-text';
   span.textContent = text;
 
   block.appendChild(span);
-  el.appendChild(block);
+
+  // 默认插入为兄弟节点（对 Obsidian Web Clipper 等 HTML→Markdown 转换器更友好）
+  // 但如果父容器是 grid/flex 布局，多出兄弟节点会破坏列宽计算（如 WSJ 文章页）
+  // 此时回退到子节点插入，保持网格单元数不变
+  const parentDisplay = window.getComputedStyle(el.parentElement).display;
+  if (parentDisplay === 'grid' || parentDisplay === 'inline-grid' ||
+      parentDisplay === 'flex' || parentDisplay === 'inline-flex') {
+    el.appendChild(block);
+  } else {
+    el.parentNode.insertBefore(block, el.nextSibling);
+  }
   el.dataset.bilingualDone = 'done';
 }
 
@@ -170,7 +205,7 @@ async function runTranslation(provider, targetLang) {
     }
 
     const batch = elements.slice(i, i + BATCH_SIZE);
-    const texts = batch.map(el => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' '));
+    const texts = batch.map(el => getVisibleText(el));
 
     try {
       const translations = await sendTranslateRequest(texts, provider, targetLang);

@@ -2,6 +2,7 @@
 .bilingual-block {
   display: block;
   margin-top: 4px;
+  margin-bottom: 1em;
   padding-left: 8px;
   border-left: 2px solid #f0597a;
   line-height: 1.65;
@@ -11,7 +12,7 @@
 .bilingual-text {
   display: block;
   color: #555;
-  font-size: 0.88em;
+  font-size: 1em;
   font-family: inherit;
   font-weight: normal;
   font-style: normal;
