@@ -1,0 +1,132 @@
+/* 隐藏 YouTube 原生 CC（但保留 DOM 节点，我们要从 .ytp-caption-segment 读取文本） */
+html.bilingual-yt-active .ytp-caption-window-container { visibility: hidden !important; }
+
+/* 控制栏按钮 */
+.bilingual-yt-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  width: 48px;
+  height: 48px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  padding: 0;
+  margin: 0;
+  opacity: .92;
+  transition: opacity .15s ease, transform .15s ease;
+}
+.bilingual-yt-icon-btn:hover { opacity: 1; transform: scale(1.05); }
+.bilingual-yt-icon-btn .bilingual-yt-icon-glyph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  overflow: hidden;
+  box-shadow: 0 1px 4px rgba(0,0,0,.45);
+}
+.bilingual-yt-icon-glyph img {
+  width: 26px;
+  height: 26px;
+  display: block;
+  object-fit: cover;
+}
+.bilingual-yt-icon-btn.is-active .bilingual-yt-icon-glyph {
+  outline: 2px solid rgba(255,255,255,.85);
+  outline-offset: 1px;
+}
+
+/* 弹出面板 */
+.bilingual-yt-panel {
+  position: fixed;
+  z-index: 2147483646;
+  min-width: 240px;
+  background: rgba(15, 23, 42, .97);
+  color: #fff;
+  border-radius: 12px;
+  padding: 14px 16px;
+  box-shadow: 0 8px 32px rgba(0,0,0,.5);
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue', sans-serif;
+  font-size: 13px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255,255,255,.08);
+}
+.bilingual-yt-panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.bilingual-yt-panel-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  gap: 12px;
+}
+.bilingual-yt-panel-label { color: #94a3b8; }
+.bilingual-yt-panel-value {
+  color: #fff;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bilingual-yt-panel-btn {
+  width: 100%;
+  margin-top: 10px;
+  background: #3083BB;
+  color: #fff;
+  border: 0;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter .15s ease;
+}
+.bilingual-yt-panel-btn:hover { filter: brightness(1.12); }
+.bilingual-yt-panel-btn:disabled {
+  background: #334155;
+  color: #64748b;
+  cursor: not-allowed;
+}
+
+/* 字幕层（叠在视频画面上，挂在 #movie_player 内） */
+.bilingual-yt-subtitles {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 8%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  pointer-events: none;
+  z-index: 35;
+  transition: bottom .2s ease;
+  padding: 0 8%;
+}
+.bilingual-yt-subtitles.controls-visible { bottom: 14%; }
+.bilingual-yt-subtitles.is-empty { display: none; }
+
+.bilingual-yt-line {
+  background: rgba(8, 8, 8, .78);
+  color: #fff;
+  padding: 4px 12px;
+  border-radius: 2px;
+  font-family: 'YouTube Sans', Roboto, Arial, -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
+  font-size: clamp(16px, 2vw, 26px);
+  line-height: 1.35;
+  text-align: center;
+  max-width: 92%;
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-shadow: 0 0 2px rgba(0,0,0,.5);
+}
+.bilingual-yt-line:empty { display: none; }
+.bilingual-yt-target { font-size: clamp(15px, 1.8vw, 24px); }
+.bilingual-yt-target.is-loading { color: #d0d0d0; font-style: italic; }

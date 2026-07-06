@@ -4,14 +4,15 @@
   margin-top: 4px;
   margin-bottom: 1em;
   padding-left: 8px;
-  border-left: 2px solid #f0597a;
+  border-left: 2px solid #3083BB;
   line-height: 1.65;
 }
 
-/* 译文文字 */
+/* 译文文字 —— 继承原文颜色，用透明度做「稍弱于原文」的视觉层级 */
 .bilingual-text {
   display: block;
-  color: #555;
+  color: inherit;
+  opacity: 0.75;
   font-size: 1em;
   font-family: inherit;
   font-weight: normal;
@@ -26,7 +27,7 @@
   margin-left: 8px;
   width: 24px;
   height: 12px;
-  background: linear-gradient(90deg, #f0597a33 25%, #f0597a99 50%, #f0597a33 75%);
+  background: linear-gradient(90deg, #3083BB22 25%, #3083BB88 50%, #3083BB22 75%);
   background-size: 200% 100%;
   animation: bilingual-shimmer 1.2s infinite;
   border-radius: 3px;
@@ -38,12 +39,9 @@
   100% { background-position: -200% 0; }
 }
 
-/* 深色模式适配 */
+/* 深色模式适配：边框略透明 */
 @media (prefers-color-scheme: dark) {
-  .bilingual-text {
-    color: #aaa;
-  }
   .bilingual-block {
-    border-left-color: #f0597aaa;
+    border-left-color: #3083BBaa;
   }
 }

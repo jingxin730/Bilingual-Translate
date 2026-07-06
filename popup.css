@@ -32,18 +32,12 @@ body {
   gap: 7px;
 }
 
-.logo-icon {
+.logo-icon-img {
   width: 28px;
   height: 28px;
-  background: #f0597a;
-  color: #fff;
-  font-size: 14px;
-  font-weight: 700;
   border-radius: 7px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
   flex-shrink: 0;
+  display: block;
 }
 
 .logo-name {
@@ -96,7 +90,7 @@ body {
 }
 
 .lang-select:focus {
-  border-color: #f0597a;
+  border-color: #3083BB;
 }
 
 /* ── 设置行 ── */
@@ -130,7 +124,7 @@ body {
 /* ── 翻译按钮 ── */
 .translate-btn {
   width: 100%;
-  background: #f0597a;
+  background: #3083BB;
   color: #fff;
   border: none;
   border-radius: 12px;
@@ -147,7 +141,7 @@ body {
 }
 
 .translate-btn:hover {
-  background: #e04060;
+  background: #2570a8;
 }
 
 .translate-btn:active {
@@ -155,18 +149,18 @@ body {
 }
 
 .translate-btn:disabled {
-  background: #f5a0b0;
+  background: #8fbfda;
   cursor: not-allowed;
   transform: none;
 }
 
-/* 停止状态：橙红色，提示可点击停止 */
+/* 停止状态 */
 .translate-btn.translate-btn-stop {
-  background: #e05540;
+  background: #1e5f8a;
 }
 
 .translate-btn.translate-btn-stop:hover {
-  background: #cc4a36;
+  background: #174e73;
 }
 
 .shortcut {
@@ -205,7 +199,7 @@ body {
   top: 0;
   height: 100%;
   width: var(--pct, 0%);
-  background: #f0597a;
+  background: #3083BB;
   border-radius: 2px;
   transition: width 0.3s ease;
 }
@@ -229,7 +223,7 @@ body {
 }
 
 .status-msg.error {
-  color: #e04060;
+  color: #dc2626;
 }
 
 .status-msg.success {
@@ -272,11 +266,11 @@ body {
 }
 
 .quick-btn:hover {
-  background: #f0f0f0;
+  background: #eaf4fb;
 }
 
 .quick-btn:active {
-  background: #e8e8e8;
+  background: #d6eaf5;
 }
 
 .qicon {

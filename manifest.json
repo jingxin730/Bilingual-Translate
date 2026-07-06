@@ -1,14 +1,21 @@
 {
   "manifest_version": 3,
-  "name": "双语翻译",
+  "name": "__MSG_appName__",
   "version": "1.0.0",
-  "description": "AI 驱动的双语对照翻译，在原文下方插入中文译文",
+  "description": "__MSG_appDesc__",
+  "default_locale": "zh_CN",
   "permissions": ["storage", "activeTab", "scripting", "tabs"],
   "host_permissions": [
     "https://code.newcli.com/*",
+    "https://*.youtube.com/*",
     "http://*/*",
     "https://*/*"
   ],
+  "icons": {
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "background": {
     "service_worker": "background.js"
   },
@@ -18,10 +25,33 @@
       "css": ["content.css"],
       "js": ["content.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["youtube-bridge.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "css": ["youtube.css"],
+      "js": ["youtube.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/icon16.png", "icons/icon48.png", "icons/icon128.png"],
+      "matches": ["*://*.youtube.com/*"]
     }
   ],
   "action": {
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "commands": {
     "translate-page": {
@@ -29,7 +59,7 @@
         "default": "Alt+A",
         "mac": "Alt+A"
       },
-      "description": "翻译/还原当前页面"
+      "description": "__MSG_shortcutDesc__"
     }
   }
 }

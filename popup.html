@@ -3,36 +3,33 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>双语翻译</title>
+  <title>Bilingual Translate</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
   <div class="app">
 
-    <!-- 顶部标题栏 -->
     <div class="header">
       <div class="logo">
-        <span class="logo-icon">译</span>
-        <span class="logo-name">双语翻译</span>
+        <img src="icons/icon48.png" class="logo-icon-img" alt="">
+        <span class="logo-name" data-i18n="appName"></span>
       </div>
       <div class="version">v1.0</div>
     </div>
 
-    <!-- 语言选择行 -->
     <div class="lang-row">
-      <div class="lang-badge">自动检测</div>
+      <div class="lang-badge" data-i18n="autoDetect"></div>
       <span class="lang-arrow">→</span>
       <select id="targetLang" class="lang-select">
         <option value="zh">简体中文</option>
         <option value="zh-TW">繁体中文</option>
-        <option value="ja">日文</option>
-        <option value="en">英文</option>
+        <option value="ja">日本語</option>
+        <option value="en">English</option>
       </select>
     </div>
 
-    <!-- 翻译服务选择 -->
     <div class="setting-row">
-      <span class="setting-label">翻译服务</span>
+      <span class="setting-label" data-i18n="translationService"></span>
       <select id="providerSelect" class="setting-select">
         <option value="claude">✦ Claude Sonnet</option>
         <option value="chatgpt">◈ GPT-5.5</option>
@@ -40,32 +37,28 @@
       </select>
     </div>
 
-    <!-- 翻译按钮 -->
     <button id="translateBtn" class="translate-btn">
-      <span id="btnLabel">翻译</span>
+      <span id="btnLabel" data-i18n="translate"></span>
       <kbd class="shortcut">⌥A</kbd>
     </button>
 
-    <!-- 进度条（翻译中才显示） -->
     <div id="progressWrap" class="progress-wrap hidden">
       <div id="progressBar" class="progress-bar"></div>
       <span id="progressText" class="progress-text">0 / 0</span>
     </div>
 
-    <!-- 状态提示 -->
     <div id="statusMsg" class="status-msg hidden"></div>
 
-    <!-- 快捷操作 -->
     <div class="quick-section">
-      <span class="quick-label">快捷操作</span>
+      <span class="quick-label" data-i18n="quickActions"></span>
       <div class="quick-btns">
-        <button class="quick-btn" id="toggleBtn" title="显示或隐藏译文">
+        <button class="quick-btn" id="toggleBtn">
           <span class="qicon">👁</span>
-          <span id="toggleLabel">隐藏译文</span>
+          <span id="toggleLabel" data-i18n="hideTranslation"></span>
         </button>
-        <button class="quick-btn" id="clearBtn" title="清除所有翻译">
+        <button class="quick-btn" id="clearBtn">
           <span class="qicon">✕</span>
-          <span>清除翻译</span>
+          <span data-i18n="clearTranslation"></span>
         </button>
       </div>
     </div>

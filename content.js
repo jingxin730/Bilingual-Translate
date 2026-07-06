@@ -1,5 +1,10 @@
 'use strict';
 
+// YouTube 由专门的 youtube.js 接管，正文翻译在此早退避免冲突
+if (/(^|\.)youtube\.com$/i.test(location.hostname)) {
+  // no-op
+} else {
+
 const BATCH_SIZE = 8;
 const MIN_LENGTH = 15;
 
@@ -148,13 +153,57 @@ function applyTranslation(el, text) {
   // 但如果父容器是 grid/flex 布局，多出兄弟节点会破坏列宽计算（如 WSJ 文章页）
   // 此时回退到子节点插入，保持网格单元数不变
   const parentDisplay = window.getComputedStyle(el.parentElement).display;
-  if (parentDisplay === 'grid' || parentDisplay === 'inline-grid' ||
-      parentDisplay === 'flex' || parentDisplay === 'inline-flex') {
+  const mustAppendInside = parentDisplay === 'grid' || parentDisplay === 'inline-grid' ||
+      parentDisplay === 'flex' || parentDisplay === 'inline-flex';
+  if (mustAppendInside) {
     el.appendChild(block);
   } else {
     el.parentNode.insertBefore(block, el.nextSibling);
+    // 监视 React/Vue 等框架的协调操作。若译文块被移走（substack/newsletter 等
+    // 站点会在水合或重渲染时把"非受控"节点统一推到容器末尾），就把它放回去；
+    // 若反复被抢，则退回子节点插入，让框架不再把它视为容器的多余兄弟。
+    guardSiblingPlacement(el, block);
   }
   el.dataset.bilingualDone = 'done';
+}
+
+// 共享 observer 注册表：parent -> { observer, watchers: Map<anchor, {block, bounces}> }
+const parentObservers = new WeakMap();
+
+function guardSiblingPlacement(anchor, block) {
+  const parent = anchor.parentNode;
+  if (!parent) return;
+
+  let registry = parentObservers.get(parent);
+  if (!registry) {
+    registry = { observer: null, watchers: new Map() };
+    const observer = new MutationObserver(() => {
+      for (const [a, info] of registry.watchers) {
+        const b = info.block;
+        const dislocated = !b.isConnected || b.previousSibling !== a;
+        if (!dislocated) continue;
+
+        if (info.bounces++ < 3 && a.isConnected && a.parentNode === parent) {
+          // 拽回原位
+          parent.insertBefore(b, a.nextSibling);
+        } else {
+          // 反复被框架抢——改成 anchor 的子节点，让框架不再把它视作多余兄弟
+          if (b.isConnected) b.remove();
+          if (a.isConnected) a.appendChild(b);
+          registry.watchers.delete(a);
+        }
+      }
+      if (registry.watchers.size === 0) {
+        observer.disconnect();
+        parentObservers.delete(parent);
+      }
+    });
+    observer.observe(parent, { childList: true });
+    registry.observer = observer;
+    parentObservers.set(parent, registry);
+  }
+
+  registry.watchers.set(anchor, { block, bounces: 0 });
 }
 
 function markError(el) {
@@ -267,3 +316,5 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       break;
   }
 });
+
+} // end non-youtube guard
