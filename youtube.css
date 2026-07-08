@@ -1,5 +1,8 @@
-/* 隐藏 YouTube 原生 CC（但保留 DOM 节点，我们要从 .ytp-caption-segment 读取文本） */
-html.bilingual-yt-active .ytp-caption-window-container { visibility: hidden !important; }
+/* 隐藏 YouTube 原生 CC — opacity:0 视觉上完全不可见，但不影响 YouTube 渲染器持续向 DOM 写入字幕文本 */
+html.bilingual-yt-active .ytp-caption-window-container {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
 
 /* 控制栏按钮 */
 .bilingual-yt-icon-btn {

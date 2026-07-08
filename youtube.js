@@ -4,8 +4,8 @@
 //   A. MAIN world fetch timedtext → 拿完整 cue 数组 → 批量预翻译（首选）
 //   B. DOM watch .ytp-caption-segment → 累积节流 → 批量翻译（兜底）
 
-const BATCH_SIZE = 12;
-const PRELOAD_AHEAD = 3;
+const BATCH_SIZE = 20;
+const PRELOAD_AHEAD = 6;
 // i18n 工具
 const t = (key) => chrome.i18n.getMessage(key) || key;
 
