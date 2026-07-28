@@ -78,6 +78,23 @@ html.bilingual-yt-active .ytp-caption-window-container {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.bilingual-yt-model-select {
+  max-width: 160px;
+  min-width: 132px;
+  padding: 5px 28px 5px 9px;
+  border: 1px solid rgba(255,255,255,.14);
+  border-radius: 7px;
+  outline: none;
+  background: #1e293b;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+.bilingual-yt-model-select:hover,
+.bilingual-yt-model-select:focus {
+  border-color: #3083BB;
+  background: #263449;
+}
 .bilingual-yt-panel-btn {
   width: 100%;
   margin-top: 10px;
@@ -133,3 +150,15 @@ html.bilingual-yt-active .ytp-caption-window-container {
 .bilingual-yt-line:empty { display: none; }
 .bilingual-yt-target { font-size: clamp(15px, 1.8vw, 24px); }
 .bilingual-yt-target.is-loading { color: #d0d0d0; font-style: italic; }
+
+/* 全屏画面需要更大的字号；窗口模式继续沿用上面的紧凑尺寸 */
+#movie_player.ytp-fullscreen .bilingual-yt-line,
+#movie_player:fullscreen .bilingual-yt-line {
+  font-size: clamp(28px, min(2.4vw, 4.2vh), 44px);
+  padding: 6px 16px;
+}
+
+#movie_player.ytp-fullscreen .bilingual-yt-target,
+#movie_player:fullscreen .bilingual-yt-target {
+  font-size: clamp(26px, min(2.2vw, 3.8vh), 40px);
+}

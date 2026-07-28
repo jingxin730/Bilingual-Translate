@@ -6,3 +6,6 @@ config.js
 
 # VSCode 工作区设置（可选，按需注释掉）
 .vscode/
+
+# workbuddy文件忽略
+.workbuddy

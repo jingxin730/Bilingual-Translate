@@ -226,7 +226,29 @@ function renderPanel() {
 
   const modelRow = document.createElement('div');
   modelRow.className = 'bilingual-yt-panel-row';
-  modelRow.innerHTML = `<span class="bilingual-yt-panel-label">${t('ytCurrentModel')}</span><span class="bilingual-yt-panel-value">${PROVIDER_LABEL[state.provider] || state.provider}</span>`;
+  const modelLabel = document.createElement('span');
+  modelLabel.className = 'bilingual-yt-panel-label';
+  modelLabel.textContent = t('ytCurrentModel');
+
+  const modelSelect = document.createElement('select');
+  modelSelect.className = 'bilingual-yt-model-select';
+  modelSelect.setAttribute('aria-label', t('ytCurrentModel'));
+  Object.entries(PROVIDER_LABEL).forEach(([value, label]) => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    modelSelect.appendChild(option);
+  });
+  modelSelect.value = state.provider;
+  modelSelect.addEventListener('change', async () => {
+    const provider = modelSelect.value;
+    if (provider === state.provider) return;
+    state.provider = provider;
+    resetTranslationCache();
+    await chrome.storage.local.set({ provider });
+  });
+
+  modelRow.append(modelLabel, modelSelect);
   panel.appendChild(modelRow);
 
   const trackInfo = document.createElement('div');
@@ -261,9 +283,25 @@ function positionPanelNearButton(panel) {
   const btn = state.buttonEl;
   if (!btn) return;
   const rect = btn.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const pw = panel.offsetWidth || 260;
+  const ph = panel.offsetHeight || 140;
+
+  // 优先显示在按钮上方，空间不足时显示在下方
+  let top = rect.top - ph - 12;
+  if (top < 8) top = rect.bottom + 8;
+  top = Math.min(top, vh - ph - 8);
+  top = Math.max(8, top);
+
+  // 水平方向：右对齐按钮，超出左边界时向右推
+  let left = rect.right - pw;
+  left = Math.max(8, left);
+  left = Math.min(left, vw - pw - 8);
+
   panel.style.position = 'fixed';
-  panel.style.top = `${Math.max(8, rect.top - panel.offsetHeight - 12)}px`;
-  panel.style.left = `${Math.max(8, rect.left - 80)}px`;
+  panel.style.top = `${top}px`;
+  panel.style.left = `${left}px`;
 }
 
 // ============================================================
@@ -333,6 +371,39 @@ function putCache(videoId, entry) {
   while (state.cache.size > VIDEO_CACHE_LIMIT) {
     const oldest = state.cache.keys().next().value;
     state.cache.delete(oldest);
+  }
+}
+
+// 模型或目标语言变化后，保留已取得的字幕，只丢弃旧配置生成的译文。
+function resetTranslationCache() {
+  state.cache.clear();
+  if (!state.videoId || !state.mode) return;
+
+  if (state.mode === 'cues') {
+    putCache(state.videoId, {
+      mode: 'cues',
+      cues: state.cues,
+      translations: new Map(),
+      batchState: new Map()
+    });
+    const currentTime = state.videoEl?.currentTime;
+    if (state.active && typeof currentTime === 'number') renderCurrentCue(currentTime);
+    return;
+  }
+
+  putCache(state.videoId, {
+    mode: 'dom',
+    textTranslations: new Map(),
+    pending: new Map()
+  });
+  state.domQueue = [];
+  if (state.domFlushTimer) {
+    clearTimeout(state.domFlushTimer);
+    state.domFlushTimer = null;
+  }
+  if (state.active && state.lastSourceText) {
+    renderDomMode(state.lastSourceText);
+    enqueueDomTranslation(state.lastSourceText);
   }
 }
 
@@ -643,6 +714,19 @@ window.addEventListener('yt-navigate-finish', () => {
   stopCaptionWatch();
   if (state.subtitleEl) setSubtitles('', '', false);
   setTimeout(requestTracks, 200);
+});
+
+// 与扩展弹窗保持同步：弹窗中切换模型/目标语言后，YouTube 立即使用新配置。
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local') return;
+  const nextProvider = changes.provider?.newValue || state.provider;
+  const nextTargetLang = changes.targetLang?.newValue || state.targetLang;
+  if (nextProvider === state.provider && nextTargetLang === state.targetLang) return;
+  state.provider = nextProvider;
+  state.targetLang = nextTargetLang;
+  const modelSelect = state.panelEl?.querySelector('.bilingual-yt-model-select');
+  if (modelSelect && modelSelect.value !== nextProvider) modelSelect.value = nextProvider;
+  resetTranslationCache();
 });
 
 // ============================================================
