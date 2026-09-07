@@ -31,6 +31,23 @@ let pollingTimer = null;
 let translationVisible = true;
 let isTranslating = false;
 
+async function loadProviders() {
+  const response = await chrome.runtime.sendMessage({ action: 'getProviders' });
+  const providers = response?.providers || {};
+
+  providerSelect.replaceChildren();
+  for (const [key, cfg] of Object.entries(providers)) {
+    const option = document.createElement('option');
+    option.value = key;
+    option.textContent = cfg.model;
+    providerSelect.appendChild(option);
+  }
+
+  if (!providerSelect.options.length) {
+    throw new Error('config.js 中没有可用的模型配置');
+  }
+}
+
 async function getTab() {
   if (currentTab) return currentTab;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -162,6 +179,13 @@ clearBtn.addEventListener('click', async () => {
 
 async function init() {
   applyI18n();
+  try {
+    await loadProviders();
+  } catch (err) {
+    translateBtn.disabled = true;
+    showStatus(err.message || String(err), 'error');
+    return;
+  }
   const saved = await chrome.storage.local.get(['provider', 'targetLang']);
   if (saved.provider) providerSelect.value = saved.provider;
   if (saved.targetLang) targetLangSelect.value = saved.targetLang;

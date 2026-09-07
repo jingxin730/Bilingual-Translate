@@ -22,9 +22,23 @@ function parseTranslations(text, count) {
   return results;
 }
 
+function resolveEndpoint(cfg) {
+  const url = cfg.url.replace(/\/+$/, '');
+
+  if (cfg.type === 'gemini') {
+    if (/:generateContent$/.test(url)) return url;
+    return `${url}/v1beta/models/${encodeURIComponent(cfg.model)}:generateContent`;
+  }
+
+  if (/\/chat\/completions$/.test(url)) return url;
+  return /\/v1$/.test(url)
+    ? `${url}/chat/completions`
+    : `${url}/v1/chat/completions`;
+}
+
 // 流式读取 OpenAI 兼容接口（Claude / ChatGPT）
 async function callOpenAIStream(texts, cfg, targetLang) {
-  const resp = await fetch(cfg.url, {
+  const resp = await fetch(resolveEndpoint(cfg), {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${API_TOKEN}`,
@@ -81,7 +95,7 @@ async function callOpenAIStream(texts, cfg, targetLang) {
 
 // Gemini 原生接口（非流式）
 async function callGemini(texts, cfg, targetLang) {
-  const resp = await fetch(cfg.url, {
+  const resp = await fetch(resolveEndpoint(cfg), {
     method: 'POST',
     headers: {
       'x-goog-api-key': API_TOKEN,
@@ -116,6 +130,14 @@ async function translate(texts, provider, targetLang = 'zh') {
 
 // 处理来自 content script 的翻译请求
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === 'getProviders') {
+    const providers = Object.fromEntries(
+      Object.entries(PROVIDERS).map(([key, cfg]) => [key, { model: cfg.model }])
+    );
+    sendResponse({ providers });
+    return;
+  }
+
   if (msg.action === 'translate') {
     translate(msg.texts, msg.provider, msg.targetLang)
       .then(translations => sendResponse({ translations }))
