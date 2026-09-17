@@ -6,7 +6,7 @@ A Chrome extension that uses AI to provide bilingual side-by-side translation �
 
 **Web Page Translation**
 - Original and translated text displayed side by side for a natural reading experience
-- Three AI backends: Claude, ChatGPT, Gemini
+- Four AI backends: Claude, ChatGPT, Gemini, DeepSeek
 - Target languages: Simplified Chinese, Traditional Chinese, Japanese, English
 - Batched concurrent translation with real-time progress
 - Stop mid-way and keep already-translated paragraphs
@@ -51,6 +51,20 @@ const PROVIDERS = {
   },
   // ...
 };
+```
+
+Each provider may also carry its own `token` (falling back to the global `API_TOKEN`), and anything in `extraBody` is merged verbatim into the request body for vendor-specific parameters. That's how the official DeepSeek API is wired up:
+
+```js
+const DEEPSEEK_API_KEY = 'your-deepseek-api-key';   // platform.deepseek.com/api_keys
+
+deepseek: {
+  url: 'https://api.deepseek.com',
+  model: 'deepseek-flash',        // or deepseek-v4-pro
+  type: 'openai',
+  token: DEEPSEEK_API_KEY,
+  extraBody: { thinking: { type: 'disabled' } }   // thinking is on by default; translation doesn't need it
+}
 ```
 
 > ⚠️ **Note**: There are many ways to access large language models (self-hosted, proxies, official APIs, etc.). The configuration above is just one example format. If it doesn't match your setup, paste the contents of `config.example.js` and `background.js` into an AI tool (e.g. Claude or ChatGPT), describe your API format, and ask it to adapt the configuration for you.

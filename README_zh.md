@@ -6,7 +6,7 @@ Chrome 扩展，使用 AI 对网页进行双语对照翻译——原文保留在
 
 **网页翻译**
 - 原文与译文并排显示，阅读体验自然
-- 支持三种 AI 服务：Claude、ChatGPT、Gemini
+- 支持四种 AI 服务：Claude、ChatGPT、Gemini、DeepSeek
 - 可选目标语言：简体中文、繁体中文、日文、英文
 - 分批并发翻译，进度实时显示
 - 支持中途停止，已翻译内容保留
@@ -51,6 +51,20 @@ const PROVIDERS = {
   },
   // ...
 };
+```
+
+每个 provider 也可以带自己的 `token`（不配则用全局 `API_TOKEN`），另外 `extraBody` 里的字段会原样合并进请求体，用来传各家的私有参数。DeepSeek 官方 API 就是这么接的：
+
+```js
+const DEEPSEEK_API_KEY = 'your-deepseek-api-key';   // platform.deepseek.com/api_keys
+
+deepseek: {
+  url: 'https://api.deepseek.com',
+  model: 'deepseek-flash',        // 或 deepseek-v4-pro
+  type: 'openai',
+  token: DEEPSEEK_API_KEY,
+  extraBody: { thinking: { type: 'disabled' } }   // 思考模式默认开启，翻译用不上
+}
 ```
 
 > ⚠️ **注意**：接入大模型的方式有很多种（自有部署、各类代理、官方 API 等），上述配置仅为参考示例。如果此格式不适用于你的大模型接口，建议将 `config.example.js` 和 `background.js` 的内容提供给 AI 工具（如 Claude、ChatGPT），说明你的接口格式，让它帮你重新适配配置。

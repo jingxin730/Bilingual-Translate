@@ -39,6 +39,40 @@
   100% { background-position: -200% 0; }
 }
 
+/* 翻译失败标记 —— 失败必须可见（否则表现就是"这段莫名其妙没翻译"），
+   而且点一下只重译这一段，不用整页重来 */
+.bilingual-failed {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border: 1px dashed #C0392B;
+  border-radius: 3px;
+  background: transparent;
+  color: #C0392B;
+  font-size: 11px;
+  font-family: inherit;
+  font-weight: normal;
+  line-height: 1.7;
+  letter-spacing: normal;
+  vertical-align: middle;
+  cursor: pointer;
+  opacity: 0.85;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color 0.15s, opacity 0.15s;
+}
+
+.bilingual-failed:hover:not(:disabled) {
+  background: rgba(192, 57, 43, 0.1);
+  opacity: 1;
+}
+
+.bilingual-failed:disabled {
+  border-style: dotted;
+  cursor: default;
+  opacity: 0.55;
+}
+
 /* 深色模式适配：边框略透明 */
 @media (prefers-color-scheme: dark) {
   .bilingual-block {
