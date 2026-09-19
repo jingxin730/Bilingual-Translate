@@ -1,34 +1,39 @@
 'use strict';
 
 // YouTube 双语字幕翻译。两种字幕来源（自动选择）：
-//   A. MAIN world fetch timedtext → 拿完整 cue 数组 → 批量预翻译（首选）
+//   A. MAIN world 截获 YouTube 自身 timedtext → 完整 cue 数组 → 批量预翻译（首选）
 //   B. DOM watch .ytp-caption-segment → 累积节流 → 批量翻译（兜底）
 
 const BATCH_SIZE = 20;
 const PRELOAD_AHEAD = 6;
 // i18n 工具
 const t = (key) => chrome.i18n.getMessage(key) || key;
+// 扩展重载后旧页面的 chrome API 会失效，提前保存错误提示所需文案。
+const PANEL_TITLE = t('ytPanelTitle');
+const PANEL_CONNECTION_ERROR = t('noConnection');
 
 const VIDEO_CACHE_LIMIT = 10;
 const DOM_BATCH_THRESHOLD = 6;     // DOM 模式累积多少条触发一次翻译
 const DOM_BATCH_TIMEOUT_MS = 1500; // 不够阈值时多久强制 flush
 
-const PROVIDER_LABEL = {
-  claude: '✦ Claude Sonnet',
-  chatgpt: '◈ GPT-5.5',
-  gemini: '◆ Gemini Pro'
-};
-
 const state = {
   videoId: null,
   tracks: [],
   pickedTrack: null,
+  tracksStatus: 'loading',
+  nativeAvailable: false,
+  tracksTimer: null,
+  navigating: false,
+  activationId: 0,
+  activationKey: null,
   mode: null,                  // 'cues' | 'dom' | null
   cues: [],
   cache: new Map(),
   active: false,
   buttonEl: null,
   panelEl: null,
+  panelOpening: false,
+  panelRequestId: 0,
   subtitleEl: null,
   controlsObserver: null,
   autohideObserver: null,
@@ -39,6 +44,7 @@ const state = {
   lastSourceText: '',
   domQueue: [],
   domFlushTimer: null,
+  providers: {},
   provider: 'claude',
   targetLang: 'zh'
 };
@@ -53,27 +59,40 @@ window.addEventListener('message', (e) => {
   if (e.source !== window) return;
   const d = e.data;
   if (d?.source !== 'bilingual-yt-bridge') return;
-  if (d.type === 'tracks') onTracksReceived(d.videoId, d.tracks || []);
+  if (d.type === 'tracks') onTracksReceived(d.videoId, d.tracks || [], d.status, d.nativeAvailable);
   else if (d.type === 'captionsResult') {
     const cb = pendingFetches.get(d.requestId);
     if (cb) { pendingFetches.delete(d.requestId); cb(d); }
   }
   else if (d.type === 'capturedCaptions') {
-    onCapturedCaptions(d.url, d.text);
+    onCapturedCaptions(d.videoId, d.url, d.text);
   }
 });
 
-function onCapturedCaptions(url, text) {
+function onCapturedCaptions(videoId, url, text) {
+  if (state.navigating || !videoId || videoId !== currentVideoId() || videoId !== state.videoId) return;
+  let captionUrl;
+  try { captionUrl = new URL(url, location.href); } catch { return; }
+  if (captionUrl.searchParams.get('v') && captionUrl.searchParams.get('v') !== videoId) return;
+  const languageCode = captionUrl.searchParams.get('lang');
+  if (captionUrl.searchParams.has('tlang')) return;
+  if (state.pickedTrack && languageCode && state.pickedTrack.languageCode !== languageCode) return;
+  if (typeof text !== 'string') return;
   if (state.mode === 'cues') return; // 已经在用 cues 了
   console.log(`[双语翻译] 拦截到 YouTube 自身的字幕请求 (${text.length} 字符)`);
   const rawCues = parseAuto(text);
   if (!rawCues.length) return;
   const cues = mergeIntoSentences(rawCues);
   console.log(`[双语翻译] ✅ 切换到 cues 模式，原始 ${rawCues.length} 条 → 合并为 ${cues.length} 句`);
-  // 停掉 DOM 模式
-  stopCaptionWatch();
-  state.mode = 'cues';
-  state.cues = cues;
+  if (!state.pickedTrack) {
+    state.pickedTrack = {
+      baseUrl: url, languageCode: languageCode || '',
+      name: languageCode || t('ytNativeCaption'),
+      kind: captionUrl.searchParams.get('kind') || '', source: 'captured'
+    };
+  }
+  state.tracksStatus = 'ready';
+  clearTimeout(state.tracksTimer);
   let entry = state.cache.get(state.videoId);
   if (!entry || entry.mode !== 'cues') {
     entry = { mode: 'cues', cues, translations: new Map(), batchState: new Map() };
@@ -81,7 +100,16 @@ function onCapturedCaptions(url, text) {
   } else {
     entry.cues = cues;
   }
-  attachTimeListener();
+  refreshPanelCaptionState();
+  // 用户未开启翻译时只缓存，避免原生 CC 请求触发后台翻译。
+  if (state.active) {
+    stopCaptionWatch();
+    state.mode = 'cues';
+    state.cues = cues;
+    mountSubtitleLayer();
+    document.documentElement.classList.add('bilingual-yt-active');
+    attachTimeListener();
+  }
 }
 
 // 把 ASR 的细碎 cue 合并成完整句子（流畅显示的关键）
@@ -108,31 +136,57 @@ function mergeIntoSentences(rawCues) {
   return out;
 }
 
+function currentVideoId() {
+  const url = new URL(location.href);
+  return url.searchParams.get('v') || (url.pathname.startsWith('/shorts/') ? url.pathname.split('/')[2] : null);
+}
+
 function requestTracks() {
-  window.postMessage({ source: 'bilingual-yt-iso', type: 'requestTracks' }, '*');
+  if (state.navigating) return;
+  const videoId = currentVideoId();
+  if (state.videoId !== videoId) resetVideoContext(videoId);
+  state.tracksStatus = 'loading';
+  clearTimeout(state.tracksTimer);
+  state.tracksTimer = setTimeout(() => {
+    if (state.videoId !== videoId) return;
+    state.tracksStatus = 'unavailable';
+    refreshPanelCaptionState();
+  }, 12000);
+  refreshPanelCaptionState();
+  window.postMessage({ source: 'bilingual-yt-iso', type: 'requestTracks', videoId }, '*');
 }
 
 function requestNativeCaptions(lang) {
-  window.postMessage({ source: 'bilingual-yt-iso', type: 'enableCaptions', languageCode: lang }, '*');
+  window.postMessage({ source: 'bilingual-yt-iso', type: 'enableCaptions', videoId: state.videoId, languageCode: lang }, '*');
 }
 
 function fetchCaptionsViaBridge(baseUrl) {
   return new Promise((resolve) => {
     const id = ++fetchSeq;
     pendingFetches.set(id, resolve);
-    window.postMessage({ source: 'bilingual-yt-iso', type: 'fetchCaptions', baseUrl, requestId: id }, '*');
+    window.postMessage({ source: 'bilingual-yt-iso', type: 'fetchCaptions', videoId: state.videoId,
+      languageCode: state.pickedTrack?.languageCode, baseUrl, requestId: id }, '*');
     setTimeout(() => {
       if (pendingFetches.has(id)) { pendingFetches.delete(id); resolve({ ok: false, error: 'timeout' }); }
     }, 8000);
   });
 }
 
-function onTracksReceived(videoId, tracks) {
-  state.videoId = videoId;
+function onTracksReceived(videoId, tracks, status, nativeAvailable = false) {
+  if (state.navigating || videoId !== currentVideoId()) return;
+  if (state.videoId !== videoId) resetVideoContext(videoId);
   state.tracks = tracks;
-  state.pickedTrack = pickTrack(tracks);
+  state.pickedTrack = pickTrack(tracks) || (state.pickedTrack?.source === 'captured' ? state.pickedTrack : null);
+  state.nativeAvailable = nativeAvailable;
+  state.tracksStatus = status || (tracks.length ? 'ready' : 'unavailable');
+  if (state.tracksStatus !== 'loading') clearTimeout(state.tracksTimer);
   console.log(`[双语翻译] 收到 tracks，视频 ${videoId}，共 ${tracks.length} 条轨道，选中:`, state.pickedTrack?.name || '无');
-  if (state.active && videoId) activateForCurrentVideo();
+  refreshPanelCaptionState();
+  if (state.active && videoId && hasCaptionSource()) activateForCurrentVideo();
+}
+
+function hasCaptionSource() {
+  return !!(state.pickedTrack || state.nativeAvailable || state.cache.get(state.videoId)?.mode === 'cues');
 }
 
 function pickTrack(tracks) {
@@ -154,8 +208,10 @@ function mountIconButton() {
   if (!right) return;
 
   const btn = document.createElement('button');
+  btn.type = 'button';
   btn.className = 'bilingual-yt-icon-btn';
   btn.setAttribute('aria-label', '双语字幕翻译');
+  btn.setAttribute('aria-expanded', 'false');
   btn.title = '双语字幕翻译';
   btn.innerHTML = '<span class="bilingual-yt-icon-glyph"><img src="' + chrome.runtime.getURL('icons/icon16.png') + '" alt="译"></span>';
 
@@ -192,15 +248,46 @@ function ensureControlsObserver() {
 // 面板
 // ============================================================
 async function togglePanel() {
-  if (state.panelEl?.isConnected) { closePanel(); return; }
-  await loadPreferences();
-  renderPanel();
+  if (state.panelEl?.isConnected || state.panelOpening) { closePanel(); return; }
+  const requestId = ++state.panelRequestId;
+  state.panelOpening = true;
+  try {
+    await loadPanelSettings();
+    if (requestId !== state.panelRequestId) return;
+    renderPanel();
+    requestTracks();
+  } catch (err) {
+    if (requestId !== state.panelRequestId) return;
+    console.warn('[双语翻译] 无法打开字幕设置:', err);
+    const panel = document.createElement('div');
+    panel.className = 'bilingual-yt-panel';
+    const message = document.createElement('div');
+    message.setAttribute('role', 'alert');
+    message.textContent = `${PANEL_TITLE}：${PANEL_CONNECTION_ERROR}`;
+    panel.appendChild(message);
+    mountPanel(panel);
+  } finally {
+    if (requestId === state.panelRequestId) state.panelOpening = false;
+  }
 }
 
 function closePanel() {
+  ++state.panelRequestId;
+  state.panelOpening = false;
   state.panelEl?.remove();
   state.panelEl = null;
+  state.buttonEl?.setAttribute('aria-expanded', 'false');
   document.removeEventListener('click', onDocClickForPanel, true);
+  document.removeEventListener('keydown', onPanelKeyDown, true);
+  document.removeEventListener('fullscreenchange', repositionPanel);
+  document.removeEventListener('scroll', repositionPanel, true);
+  window.removeEventListener('resize', repositionPanel);
+}
+
+function onPanelKeyDown(e) {
+  if (e.key !== 'Escape') return;
+  closePanel();
+  e.stopPropagation();
 }
 
 function onDocClickForPanel(e) {
@@ -209,10 +296,24 @@ function onDocClickForPanel(e) {
   closePanel();
 }
 
-async function loadPreferences() {
-  const saved = await chrome.storage.local.get(['provider', 'targetLang']);
-  if (saved.provider) state.provider = saved.provider;
-  if (saved.targetLang) state.targetLang = saved.targetLang;
+async function loadPanelSettings() {
+  // 与网页翻译弹窗共用后台配置，只接收模型名称，不向页面暴露 API Key。
+  const [saved, response] = await Promise.all([
+    chrome.storage.local.get(['provider', 'targetLang']),
+    chrome.runtime.sendMessage({ action: 'getProviders' })
+  ]);
+  const providers = response?.providers || {};
+  const keys = Object.keys(providers);
+  if (!keys.length) throw new Error('config.js 中没有可用的模型配置');
+
+  const preferred = saved.provider || state.provider;
+  const provider = keys.includes(preferred) ? preferred : keys[0];
+  const targetLang = saved.targetLang || state.targetLang;
+  const changed = provider !== state.provider || targetLang !== state.targetLang;
+  state.providers = providers;
+  state.provider = provider;
+  state.targetLang = targetLang;
+  if (changed) resetTranslationCache();
 }
 
 function renderPanel() {
@@ -221,7 +322,7 @@ function renderPanel() {
 
   const title = document.createElement('div');
   title.className = 'bilingual-yt-panel-title';
-  title.textContent = t('ytPanelTitle');
+  title.textContent = PANEL_TITLE;
   panel.appendChild(title);
 
   const modelRow = document.createElement('div');
@@ -233,10 +334,10 @@ function renderPanel() {
   const modelSelect = document.createElement('select');
   modelSelect.className = 'bilingual-yt-model-select';
   modelSelect.setAttribute('aria-label', t('ytCurrentModel'));
-  Object.entries(PROVIDER_LABEL).forEach(([value, label]) => {
+  Object.entries(state.providers).forEach(([value, cfg]) => {
     const option = document.createElement('option');
     option.value = value;
-    option.textContent = label;
+    option.textContent = cfg.model;
     modelSelect.appendChild(option);
   });
   modelSelect.value = state.provider;
@@ -253,30 +354,71 @@ function renderPanel() {
 
   const trackInfo = document.createElement('div');
   trackInfo.className = 'bilingual-yt-panel-row';
-  const trackText = state.pickedTrack
-    ? `${state.pickedTrack.name}${state.pickedTrack.kind === 'asr' ? t('ytAutoGenerated') : ''}`
-    : t('ytNoCaption');
-  trackInfo.innerHTML = `<span class="bilingual-yt-panel-label">${t('ytSubtitleSource')}</span><span class="bilingual-yt-panel-value">${trackText}</span>`;
+  const trackLabel = document.createElement('span');
+  trackLabel.className = 'bilingual-yt-panel-label';
+  trackLabel.textContent = t('ytSubtitleSource');
+  const trackValue = document.createElement('span');
+  trackValue.className = 'bilingual-yt-panel-value bilingual-yt-caption-source';
+  trackInfo.append(trackLabel, trackValue);
   panel.appendChild(trackInfo);
 
   const action = document.createElement('button');
+  action.type = 'button';
   action.className = 'bilingual-yt-panel-btn';
-  if (state.active) {
-    action.textContent = t('ytStop');
-    action.addEventListener('click', () => { deactivate(); closePanel(); });
-  } else if (!state.pickedTrack) {
-    action.textContent = t('ytNoCaption');
-    action.disabled = true;
-  } else {
-    action.textContent = t('ytStart');
-    action.addEventListener('click', () => { activate(); closePanel(); });
-  }
+  action.addEventListener('click', () => {
+    if (state.active) { deactivate(); closePanel(); }
+    else if (hasCaptionSource()) { activate(); closePanel(); }
+    else requestTracks();
+  });
   panel.appendChild(action);
+  const hint = document.createElement('div');
+  hint.className = 'bilingual-yt-caption-hint';
+  hint.textContent = t('ytCaptionUnavailableHint');
+  panel.appendChild(hint);
 
-  document.body.appendChild(panel);
-  positionPanelNearButton(panel);
+  mountPanel(panel);
+  refreshPanelCaptionState();
+}
+
+function refreshPanelCaptionState() {
+  const panel = state.panelEl;
+  const source = panel?.querySelector('.bilingual-yt-caption-source');
+  if (!source) return;
+  const available = hasCaptionSource();
+  const loading = state.tracksStatus === 'loading';
+  source.textContent = state.pickedTrack
+    ? `${state.pickedTrack.name}${state.pickedTrack.kind === 'asr' ? t('ytAutoGenerated') : ''}`
+    : available ? t('ytNativeCaption') : loading ? t('ytDetectingCaptions') : t('ytNoCaption');
+  const action = panel.querySelector('.bilingual-yt-panel-btn');
+  action.textContent = state.active ? t('ytStop') : available ? t('ytStart')
+    : loading ? t('ytDetectingCaptions') : t('ytRetryCaptions');
+  action.disabled = !state.active && !available && loading;
+  panel.querySelector('.bilingual-yt-caption-hint').hidden = available || loading;
+  repositionPanel();
+}
+
+function mountPanel(panel) {
   state.panelEl = panel;
-  setTimeout(() => document.addEventListener('click', onDocClickForPanel, true), 0);
+  // 全屏只显示 fullscreenElement 及其后代；body 上再大的 z-index 也无效。
+  repositionPanel();
+  if (state.panelEl !== panel) return;
+  panel.addEventListener('click', e => e.stopPropagation());
+  panel.addEventListener('keydown', e => e.stopPropagation());
+  state.buttonEl?.setAttribute('aria-expanded', 'true');
+  document.addEventListener('click', onDocClickForPanel, true);
+  document.addEventListener('keydown', onPanelKeyDown, true);
+  document.addEventListener('fullscreenchange', repositionPanel);
+  document.addEventListener('scroll', repositionPanel, true);
+  window.addEventListener('resize', repositionPanel);
+}
+
+function repositionPanel() {
+  const panel = state.panelEl;
+  if (!panel) return;
+  if (!state.buttonEl?.isConnected) { closePanel(); return; }
+  const host = document.fullscreenElement || document.body;
+  if (panel.parentElement !== host) host.appendChild(panel);
+  positionPanelNearButton(panel);
 }
 
 function positionPanelNearButton(panel) {
@@ -308,6 +450,7 @@ function positionPanelNearButton(panel) {
 // 激活 / 停用
 // ============================================================
 function activate() {
+  if (!hasCaptionSource() || !state.videoId) return;
   state.active = true;
   document.documentElement.classList.add('bilingual-yt-active');
   refreshButtonState();
@@ -315,6 +458,8 @@ function activate() {
 }
 
 function deactivate() {
+  ++state.activationId;
+  state.activationKey = null;
   state.active = false;
   document.documentElement.classList.remove('bilingual-yt-active');
   unmountSubtitleLayer();
@@ -325,19 +470,29 @@ function deactivate() {
 }
 
 async function activateForCurrentVideo() {
-  if (!state.pickedTrack || !state.videoId) {
+  if (state.navigating || !state.active || !hasCaptionSource() || !state.videoId || state.videoId !== currentVideoId()) {
     console.warn('[双语翻译] 无可用字幕或视频 ID');
     return;
   }
-  console.log('[双语翻译] 激活字幕，轨道:', state.pickedTrack);
+  const videoId = state.videoId;
+  const track = state.pickedTrack;
+  const activationKey = `${videoId}:${track?.languageCode || ''}`;
+  if (state.activationKey === activationKey) return;
+  state.activationKey = activationKey;
+  const activationId = ++state.activationId;
+  detachTimeListener();
+  stopCaptionWatch();
+  state.mode = null;
+  document.documentElement.classList.add('bilingual-yt-active');
   mountSubtitleLayer();
 
-  let entry = state.cache.get(state.videoId);
+  let entry = state.cache.get(videoId);
   if (!entry || (!entry.cues && !entry.textTranslations)) {
-    // 先尝试 MAIN world fetch
-    const res = await fetchCaptionsViaBridge(state.pickedTrack.baseUrl);
+    // 优先复用 YouTube 已获取的字幕；缓存未命中就立即开启原生 CC 的 DOM 兜底。
+    const res = track?.baseUrl ? await fetchCaptionsViaBridge(track.baseUrl) : { ok: false, error: 'no-base-url' };
+    if (!state.active || state.videoId !== videoId || state.activationId !== activationId || state.mode === 'cues') return;
     if (res.ok) {
-      const cues = parseAuto(res.text);
+      const cues = mergeIntoSentences(parseAuto(res.text));
       if (cues.length) {
         console.log(`[双语翻译] ✅ cues 模式，${cues.length} 条 (via ${res.label})`);
         entry = { mode: 'cues', cues, translations: new Map(), batchState: new Map() };
@@ -352,7 +507,7 @@ async function activateForCurrentVideo() {
     entry = { mode: 'dom', textTranslations: new Map(), pending: new Map() };
     state.mode = 'dom';
     putCache(state.videoId, entry);
-    requestNativeCaptions(state.pickedTrack.languageCode || 'en');
+    requestNativeCaptions(track?.languageCode);
     startCaptionWatch();
   } else {
     state.mode = entry.mode;
@@ -360,7 +515,7 @@ async function activateForCurrentVideo() {
       state.cues = entry.cues;
       attachTimeListener();
     } else {
-      requestNativeCaptions(state.pickedTrack.languageCode || 'en');
+      requestNativeCaptions(track?.languageCode);
       startCaptionWatch();
     }
   }
@@ -595,7 +750,7 @@ async function ensureBatch(entry, batchId, total) {
 const DOM_SETTLE_MS = 600;  // 文本停止变化多久算「稳定」
 
 function getCurrentNativeText() {
-  const segs = document.querySelectorAll('.ytp-caption-segment');
+  const segs = document.querySelectorAll('#movie_player .ytp-caption-segment');
   if (!segs.length) return '';
   return Array.from(segs).map(s => s.textContent.trim()).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
 }
@@ -707,13 +862,37 @@ function sendTranslateRequest(texts) {
 // ============================================================
 // SPA 导航
 // ============================================================
-window.addEventListener('yt-navigate-finish', () => {
+function resetVideoContext(videoId) {
+  ++state.activationId;
+  state.activationKey = null;
+  state.videoId = videoId;
+  state.tracks = [];
+  state.pickedTrack = null;
+  state.nativeAvailable = false;
+  state.tracksStatus = 'loading';
+  clearTimeout(state.tracksTimer);
+  for (const resolve of pendingFetches.values()) resolve({ ok: false, error: 'video-changed' });
+  pendingFetches.clear();
   state.cues = [];
   state.mode = null;
   detachTimeListener();
   stopCaptionWatch();
+  document.documentElement.classList.remove('bilingual-yt-active');
   if (state.subtitleEl) setSubtitles('', '', false);
-  setTimeout(requestTracks, 200);
+  refreshPanelCaptionState();
+}
+
+window.addEventListener('yt-navigate-start', () => {
+  state.navigating = true;
+  closePanel();
+  resetVideoContext(null);
+});
+
+window.addEventListener('yt-navigate-finish', () => {
+  state.navigating = false;
+  closePanel();
+  resetVideoContext(currentVideoId());
+  requestTracks();
 });
 
 // 与扩展弹窗保持同步：弹窗中切换模型/目标语言后，YouTube 立即使用新配置。

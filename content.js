@@ -149,6 +149,32 @@ function isCapsLabel(text) {
   return text === text.toUpperCase();
 }
 
+// 卡片标题链接：首页/列表页的主标题本身就是一个 <a>，而标题文字挂在哪里各站不同——
+// 可能直接是 <a> 的文本，也可能包在 span / div / hN 里。前两种既不在 QUERY 里、
+// 也不是叶子 div（<a> 不在 BLOCK_TAGS 中，外层卡片 div 也因此不算叶子），
+// 于是整行主标题从头到尾没进过候选池：连"被拦掉"的日志都不会有，表现就是
+// 副标题翻了、主标题一直不翻（经济学人首页）。
+// 把"一整句话的链接"也收进候选：导航项、按钮、栏目标签、"5 min read" 都够不到这个门槛。
+const HEADLINE_LINK_MIN = 25;     // 文字长度下限
+const HEADLINE_LINK_WORDS = 4;    // 词数下限（中日文没有空格，另给长度兜底）
+const HEADLINE_LINK_LONG = 40;
+function isHeadlineLink(a) {
+  // 链接里还套着链接 → 这是卡片容器而非单条标题，交给它内部的元素去处理
+  if (a.querySelector('a[href]')) return false;
+  // 标题标签自己就是候选（isHeading 放行），不必把里面的链接再收一遍
+  if (a.closest('h1, h2, h3, h4, h5, h6')) return false;
+  const text = getVisibleText(a);
+  if (text.length < HEADLINE_LINK_MIN) return false;
+  if (isCapsLabel(text)) return false;
+  // 【关键】句子中间的行内链接（"详见本刊上周的封面文章"）绝不能当标题：去重时
+  // "外层让位内层"会把包着它的 <p> 删掉，结果整段正文只翻了链接那几个字。
+  // 判据是链接文字撑不满所在段落 —— 而 <p class="title"><a>标题</a></p> 这种
+  // 纯包装能撑满，仍然放行。
+  const prose = a.parentElement?.closest('p, li, blockquote, figcaption, td, th');
+  if (prose && getVisibleText(prose).length > text.length * 1.15) return false;
+  return text.split(/\s+/).length >= HEADLINE_LINK_WORDS || text.length >= HEADLINE_LINK_LONG;
+}
+
 // 样板文字：混在正文容器里面的非正文内容——版权声明、评论入口、推荐位标题、
 // 通讯推广。它们在 article 里面，排除不了区域也不是外壳 class，只能按文字认。
 // 每条都必须锚定或足够独特：宁可漏拦一条垃圾，也不能误杀真正提到这些词的正文段落。
@@ -259,20 +285,23 @@ function getTranslatableElements() {
   // 各条规则拦掉了多少个候选 —— 排查"某段为什么没翻译"时看这个
   const stats = { 已处理: 0, 译文丢失: 0, 标题之上: 0, 排除区域: 0, 链接内: 0, 太短: 0, 中文: 0, 全大写: 0, 样板文字: 0, 数字条: 0, 链接密度: 0, 隐藏: 0, 零尺寸: 0, 嵌套: 0 };
   const bodyDrops = [];   // 正文容器内被拦掉的长文本——漏译的元凶都在这里
+  const otherDrops = [];  // 正文容器外被拦掉的长文本：首页/列表页往往没有 article/main，
+                          // 只记正文容器内的话，这类页面漏译时日志里一条线索都没有
 
   function tryAdd(el) {
     if (seen.has(el)) return;
     if (el.closest('.bilingual-block')) return;
 
-    // 拦掉一个候选。若它在正文容器内且是成段长文本，几乎必然是误伤 —— 单独打出来，
-    // 这样"某段为什么没翻译"不用再靠猜（太短的不记：<15 字符不可能是正文段落）。
+    // 拦掉一个候选。若它是成段长文本，几乎必然是误伤 —— 单独打出来，这样
+    // "某段为什么没翻译"不用再靠猜（太短的不记：<40 字符不一定是正文段落）。
     // detail 说明是哪条规则命中的，否则同一个"排除区域"里分不清是哪个祖先干的。
     const drop = (reason, text, detail) => {
       stats[reason]++;
-      if (bodyDrops.length < 15 && el.closest(CONTENT_ROOT_SEL)) {
+      const bucket = el.closest(CONTENT_ROOT_SEL) ? bodyDrops : otherDrops;
+      if (bucket.length < 15) {
         const t = text ?? getVisibleText(el);
         if (t.length >= 40) {
-          bodyDrops.push(`  ${reason}${detail ? `(${detail})` : ''}｜<${el.tagName.toLowerCase()}> ${t.slice(0, 70)}`);
+          bucket.push(`  ${reason}${detail ? `(${detail})` : ''}｜<${el.tagName.toLowerCase()}> ${t.slice(0, 70)}`);
         }
       }
     };
@@ -294,11 +323,22 @@ function getTranslatableElements() {
         (headline.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING) &&
         !el.closest(CONTENT_ROOT_SEL)) { stats.标题之上++; return; }
 
-    const isHeading = el.tagName === 'H1' || el.tagName === 'H2';
-    const excluded = excludedReason(el, isHeading);
+    // 标题标签一律视为正文，不受"整块在链接里就是导航项"的限制：列表页/首页的
+    // 卡片标题本来就是可点击的，整个 <hN> 包在 <a> 里是常态。曾只放行 h1/h2，
+    // 结果经济学人首页每张卡片只翻副标题、主标题全被当导航项跳过。
+    const isHeading = /^H[1-6]$/.test(el.tagName);
+    // 但"跳出站点 <header>"的例外只给 h1/h2：顶栏下拉菜单里的栏目标题常是 h3/h4，
+    // 放行它们等于把导航菜单也翻一遍。
+    const isMainHeading = el.tagName === 'H1' || el.tagName === 'H2';
+    const excluded = excludedReason(el, isMainHeading);
     if (excluded) { drop('排除区域', undefined, excluded); return; }
-    // 整块包在链接里的文字是导航项/卡片/行情条（标题偶尔自链接，故放行）
-    if (!isHeading && el.closest('a[href]')) { drop('链接内'); return; }
+    // 整块包在链接里的文字是导航项/卡片/行情条（标题、标题链接除外）。
+    // closest 含自身，所以 <a> 候选要从父节点往上找，否则它永远拦住自己。
+    const wrappingLink = el.tagName === 'A'
+      ? el.parentElement?.closest('a[href]')
+      : el.closest('a[href]');
+    const isTitleLink = el.tagName === 'A' && isHeadlineLink(el);
+    if (!isHeading && !isTitleLink && wrappingLink) { drop('链接内'); return; }
 
     const text = getVisibleText(el);
     if (text.length < MIN_LENGTH) { stats.太短++; return; }
@@ -306,7 +346,10 @@ function getTranslatableElements() {
     if (isCapsLabel(text)) { drop('全大写', text); return; }
     if (isBoilerplate(text)) { drop('样板文字', text); return; }
     if (isDataStrip(text)) { drop('数字条', text); return; }
-    if (linkTextRatio(el) > LINK_RATIO_MAX) { drop('链接密度', text); return; }
+    // 标题里只包着一个链接（<h3><a>标题</a></h3>）是最常见的卡片写法，链接占比
+    // 必然是 100%，但它是标题不是导航条 —— 内部有多个链接才算导航。
+    const isSelfLinkHeading = isHeading && el.querySelectorAll('a[href]').length === 1;
+    if (!isSelfLinkHeading && linkTextRatio(el) > LINK_RATIO_MAX) { drop('链接密度', text); return; }
     const hidden = hiddenReason(el);
     if (hidden) { drop(hidden, text); return; }
 
@@ -321,6 +364,12 @@ function getTranslatableElements() {
   document.querySelectorAll('div').forEach(el => {
     if (!isLeafDiv(el)) return;
     tryAdd(el);
+  });
+
+  // 第三遍：卡片标题链接（首页/列表页的主标题）。若链接内部已经有 hN 之类的
+  // 候选被选中，下面的"外层让位内层"会把这个 <a> 去掉，不会翻两遍。
+  document.querySelectorAll('a[href]').forEach(el => {
+    if (isHeadlineLink(el)) tryAdd(el);
   });
 
   // 按文档顺序排列：首批就是标题和开头段落，译文自上而下逐段出现
@@ -342,6 +391,9 @@ function getTranslatableElements() {
   console.log(`[双语翻译] 选中 ${kept.size} 段${skipped ? `；跳过：${skipped}` : ''}${headline ? `；主标题「${getVisibleText(headline).slice(0, 30)}」` : '；未识别到主标题'}`);
   if (bodyDrops.length) {
     console.warn(`[双语翻译] 正文容器内被拦掉的长文本（${bodyDrops.length} 条，漏译元凶通常在此）：\n${bodyDrops.join('\n')}`);
+  }
+  if (otherDrops.length) {
+    console.warn(`[双语翻译] 正文容器外被拦掉的长文本（${otherDrops.length} 条，首页/列表页看这里）：\n${otherDrops.join('\n')}`);
   }
 
   const finalList = result.filter(el => kept.has(el));

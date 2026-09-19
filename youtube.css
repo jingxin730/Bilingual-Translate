@@ -114,6 +114,12 @@ html.bilingual-yt-active .ytp-caption-window-container {
   color: #64748b;
   cursor: not-allowed;
 }
+.bilingual-yt-caption-hint {
+  max-width: 270px;
+  margin-top: 10px;
+  color: #94a3b8;
+  line-height: 1.5;
+}
 
 /* 字幕层（叠在视频画面上，挂在 #movie_player 内） */
 .bilingual-yt-subtitles {
