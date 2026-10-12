@@ -27,6 +27,25 @@ const CAPS_LABEL_MAX = 80;    // 全大写且短于此长度 → 栏目标签/�
 
 // 语义化标签选择器（大多数网站用这些做段落）
 const QUERY = 'p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th';
+// 新闻卡片也会用带 headline 标记的 span/div，或 ARIA heading 来承载主标题。
+const MARKED_HEADLINE_QUERY = '[role="heading"], [data-component="headline"], [data-testid="headline"], [class*="headline"], [class*="Headline"]';
+// WSJ 的副标题是 flexcard-text 段落，外层是 aria-hidden="true" 的冗余链接；
+// 段落视觉上正常显示，应按副标题收集，不能当作导航或隐藏链接跳过。
+const MARKED_SUMMARY_QUERY = '[data-testid="flexcard-text"], [data-component="summary"], [data-testid="summary"], [class*="summary"], [class*="Summary"], [class*="subheadline"], [class*="subHeadline"], [class*="standfirst"]';
+
+function isHeadingElement(el) {
+  if (/^H[1-6]$/.test(el.tagName) || el.getAttribute('role') === 'heading') return true;
+  // headline 外壳可能包着标题和摘要；有独立段落/标题时交给内层元素。
+  return el.matches(MARKED_HEADLINE_QUERY) && !el.querySelector(QUERY);
+}
+
+function isSummaryElement(el) {
+  const summary = el.closest(MARKED_SUMMARY_QUERY);
+  if (!summary || el.querySelector(QUERY)) return false;
+  if (el.tagName === 'DIV' && !isLeafDiv(el)) return false;
+  // 带 summary 字样的整张卡片仍交给独立标题和段落，避免把卡片当成副标题。
+  return !summary.querySelector('h1, h2, h3, h4, h5, h6, [role="heading"]');
+}
 
 // 块级标签集合——用于判断 div 是否为叶子容器
 const BLOCK_TAGS = new Set([
@@ -171,7 +190,20 @@ function isHeadlineLink(a) {
   // 判据是链接文字撑不满所在段落 —— 而 <p class="title"><a>标题</a></p> 这种
   // 纯包装能撑满，仍然放行。
   const prose = a.parentElement?.closest('p, li, blockquote, figcaption, td, th');
-  if (prose && getVisibleText(prose).length > text.length * 1.15) return false;
+  if (prose && getVisibleText(prose).length > text.length * 1.15) {
+    // li 也可能是整张新闻卡片，含独立标题与摘要。只有标题位于独立块内时
+    // 才放行；普通列表正文中的行内链接仍由整段 li 翻译，避免漏掉周围文字。
+    let standalone = false;
+    if (prose.tagName === 'LI') {
+      for (let node = a; node && node !== prose; node = node.parentElement) {
+        if (isHeadingElement(node) || /^(block|flow-root|flex|grid)$/.test(window.getComputedStyle(node).display)) {
+          standalone = true;
+          break;
+        }
+      }
+    }
+    if (!standalone) return false;
+  }
   return text.split(/\s+/).length >= HEADLINE_LINK_WORDS || text.length >= HEADLINE_LINK_LONG;
 }
 
@@ -281,6 +313,7 @@ function findHeadline() {
 function getTranslatableElements() {
   const seen = new Set();
   const result = [];
+  const cardTextElements = new WeakSet();
   const headline = findHeadline();
   // 各条规则拦掉了多少个候选 —— 排查"某段为什么没翻译"时看这个
   const stats = { 已处理: 0, 译文丢失: 0, 标题之上: 0, 排除区域: 0, 链接内: 0, 太短: 0, 中文: 0, 全大写: 0, 样板文字: 0, 数字条: 0, 链接密度: 0, 隐藏: 0, 零尺寸: 0, 嵌套: 0 };
@@ -317,6 +350,10 @@ function getTranslatableElements() {
       }
     }
 
+    // 补漏轮不能把已拆分并处理的标题/摘要重新合成外层卡片再翻一次。
+    // 内层如果译文丢失，会在它自己的 tryAdd 调用里放行重翻。
+    if (el.querySelector('[data-bilingual-done]')) { stats.嵌套++; return; }
+
     // 站点外壳（顶栏、行情条、推广条）总在文章主标题之上，一律不翻；
     // 正文容器内的元素不受此限，避免误伤没有典型页头的页面
     if (headline && el !== headline &&
@@ -326,7 +363,8 @@ function getTranslatableElements() {
     // 标题标签一律视为正文，不受"整块在链接里就是导航项"的限制：列表页/首页的
     // 卡片标题本来就是可点击的，整个 <hN> 包在 <a> 里是常态。曾只放行 h1/h2，
     // 结果经济学人首页每张卡片只翻副标题、主标题全被当导航项跳过。
-    const isHeading = /^H[1-6]$/.test(el.tagName);
+    const isHeading = isHeadingElement(el);
+    const isSummary = isSummaryElement(el);
     // 但"跳出站点 <header>"的例外只给 h1/h2：顶栏下拉菜单里的栏目标题常是 h3/h4，
     // 放行它们等于把导航菜单也翻一遍。
     const isMainHeading = el.tagName === 'H1' || el.tagName === 'H2';
@@ -338,7 +376,7 @@ function getTranslatableElements() {
       ? el.parentElement?.closest('a[href]')
       : el.closest('a[href]');
     const isTitleLink = el.tagName === 'A' && isHeadlineLink(el);
-    if (!isHeading && !isTitleLink && wrappingLink) { drop('链接内'); return; }
+    if (!isHeading && !isSummary && !isTitleLink && wrappingLink && !cardTextElements.has(el)) { drop('链接内'); return; }
 
     const text = getVisibleText(el);
     if (text.length < MIN_LENGTH) { stats.太短++; return; }
@@ -349,7 +387,7 @@ function getTranslatableElements() {
     // 标题里只包着一个链接（<h3><a>标题</a></h3>）是最常见的卡片写法，链接占比
     // 必然是 100%，但它是标题不是导航条 —— 内部有多个链接才算导航。
     const isSelfLinkHeading = isHeading && el.querySelectorAll('a[href]').length === 1;
-    if (!isSelfLinkHeading && linkTextRatio(el) > LINK_RATIO_MAX) { drop('链接密度', text); return; }
+    if (!isSelfLinkHeading && !isSummary && linkTextRatio(el) > LINK_RATIO_MAX) { drop('链接密度', text); return; }
     const hidden = hiddenReason(el);
     if (hidden) { drop(hidden, text); return; }
 
@@ -359,6 +397,22 @@ function getTranslatableElements() {
 
   // 第一遍：语义化标签
   document.querySelectorAll(QUERY).forEach(tryAdd);
+
+  // 补充非 hN 标签的新闻标题，保留它自己的字号和所在位置。
+  document.querySelectorAll(MARKED_HEADLINE_QUERY).forEach(el => {
+    if (isHeadingElement(el)) tryAdd(el);
+  });
+
+  // 单独收集副标题，不依赖外层卡片或标题本轮是否被选中；补漏轮也能补上。
+  document.querySelectorAll(MARKED_SUMMARY_QUERY).forEach(summary => {
+    if (isSummaryElement(summary)) {
+      tryAdd(summary);
+    } else {
+      summary.querySelectorAll('p, div, span').forEach(el => {
+        if (isSummaryElement(el)) tryAdd(el);
+      });
+    }
+  });
 
   // 第二遍：叶子 div（Modern 网站如经济学人用 div 做段落）
   document.querySelectorAll('div').forEach(el => {
@@ -371,6 +425,32 @@ function getTranslatableElements() {
   document.querySelectorAll('a[href]').forEach(el => {
     if (isHeadlineLink(el)) tryAdd(el);
   });
+
+  // 原来整张卡片可能只选中一个 div/a，标题与摘要被合成一条译文放在卡片末尾。
+  // 拆出独立标题后，补收同一候选容器中的独立摘要（包括 span 和整卡链接内的 p），
+  // 避免下面的外层去重把尚未选中的摘要一起丢掉。普通正文不作 span 拆分。
+  const titles = result.filter(el => isHeadingElement(el) || (el.tagName === 'A' && isHeadlineLink(el)));
+  const cardContainers = new Map();
+  for (const title of titles) {
+    for (let parent = title.parentElement; parent; parent = parent.parentElement) {
+      if (!seen.has(parent)) continue;
+      if (!cardContainers.has(parent)) cardContainers.set(parent, []);
+      cardContainers.get(parent).push(title);
+    }
+  }
+  for (const [container, nestedTitles] of cardContainers) {
+    for (const part of container.querySelectorAll('p, div, span')) {
+      if (nestedTitles.some(title => part === title || part.contains(title))) continue;
+      if (part.tagName === 'DIV' ? !isLeafDiv(part) : !!part.querySelector(QUERY)) continue;
+      let covered = false;
+      for (let node = part.parentElement; node && node !== container; node = node.parentElement) {
+        if (seen.has(node)) { covered = true; break; }
+      }
+      if (covered) continue;
+      cardTextElements.add(part);
+      tryAdd(part);
+    }
+  }
 
   // 按文档顺序排列：首批就是标题和开头段落，译文自上而下逐段出现
   result.sort((a, b) =>
@@ -385,7 +465,7 @@ function getTranslatableElements() {
       p = p.parentElement;
     }
   }
-  stats.嵌套 = result.length - kept.size;
+  stats.嵌套 += result.length - kept.size;
 
   const skipped = Object.entries(stats).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`).join('，');
   console.log(`[双语翻译] 选中 ${kept.size} 段${skipped ? `；跳过：${skipped}` : ''}${headline ? `；主标题「${getVisibleText(headline).slice(0, 30)}」` : '；未识别到主标题'}`);
@@ -416,6 +496,47 @@ function getTranslatableElements() {
 // guardSiblingPlacement 守护，所以必须靠这里兜住。
 const appliedBlocks = new WeakMap();   // anchor -> block，按元素查
 const trackedPairs = new Set();        // {anchor, block}，可遍历，用于批量修复
+const insideBlocks = new WeakSet();    // 内部插入过的块在恢复/窗口缩放时保持内部插入
+
+// 普通 block 布局也可能只让原文段落居中限宽（如 Bloomberg），而父容器占满页面。
+// 这种情况下兄弟译文不会继承段落的列宽、缩进和响应式样式，必须留在原文内部。
+function shouldAppendTranslationInside(el) {
+  const parent = el.parentElement;
+  const parentStyle = window.getComputedStyle(parent);
+  if (/^(inline-)?(grid|flex)$/.test(parentStyle.display)) return true;
+
+  const style = window.getComputedStyle(el);
+  if (style.maxWidth && style.maxWidth !== 'none') return true;
+
+  const rect = el.getBoundingClientRect();
+  const parentRect = parent.getBoundingClientRect();
+  if (!rect.width || !parentRect.width) return false;
+  const px = value => parseFloat(value) || 0;
+  const contentLeft = parentRect.left + px(parentStyle.borderLeftWidth) + px(parentStyle.paddingLeft);
+  const contentRight = parentRect.right - px(parentStyle.borderRightWidth) - px(parentStyle.paddingRight);
+  const textLeft = rect.left + px(style.borderLeftWidth) + px(style.paddingLeft);
+  const textRight = rect.right - px(style.borderRightWidth) - px(style.paddingRight);
+  return Math.abs(textLeft - contentLeft) > 1 || Math.abs(textRight - contentRight) > 1;
+}
+
+// 初次插入、恢复被删除的译文、窗口缩放共用同一套位置规则。
+function placeTranslationBlock(anchor, block) {
+  if (insideBlocks.has(block) || shouldAppendTranslationInside(anchor)) {
+    stopSiblingPlacementGuard(anchor);
+    insideBlocks.add(block);
+    anchor.appendChild(block);
+  } else {
+    anchor.parentNode.insertBefore(block, anchor.nextSibling);
+    guardSiblingPlacement(anchor, block);
+  }
+}
+
+function syncTranslationPlacement() {
+  for (const { anchor, block } of trackedPairs) {
+    if (!anchor.isConnected || !anchor.parentElement || !block.isConnected || insideBlocks.has(block)) continue;
+    if (shouldAppendTranslationInside(anchor)) placeTranslationBlock(anchor, block);
+  }
+}
 
 const REPAIR_WINDOW = 30000;   // 收尾后继续守护多久（React 水合往往晚于翻译完成）
 const REPAIR_INTERVAL = 1000;
@@ -437,9 +558,7 @@ function repairLostBlocks() {
     if (block.isConnected) continue;
     const parent = anchor.parentElement;
     if (!parent) continue;
-    const display = window.getComputedStyle(parent).display;
-    if (/grid|flex/.test(display)) anchor.appendChild(block);
-    else parent.insertBefore(block, anchor.nextSibling);
+    placeTranslationBlock(anchor, block);
     repaired++;
   }
   return repaired;
@@ -564,29 +683,28 @@ function applyTranslation(el, text) {
 
   block.appendChild(span);
 
-  // 默认插入为兄弟节点（对 Obsidian Web Clipper 等 HTML→Markdown 转换器更友好）
-  // 但如果父容器是 grid/flex 布局，多出兄弟节点会破坏列宽计算（如 WSJ 文章页）
-  // 此时回退到子节点插入，保持网格单元数不变
-  const parentDisplay = window.getComputedStyle(el.parentElement).display;
-  const mustAppendInside = parentDisplay === 'grid' || parentDisplay === 'inline-grid' ||
-      parentDisplay === 'flex' || parentDisplay === 'inline-flex';
-  if (mustAppendInside) {
-    el.appendChild(block);
-  } else {
-    el.parentNode.insertBefore(block, el.nextSibling);
-    // 监视 React/Vue 等框架的协调操作。若译文块被移走（substack/newsletter 等
-    // 站点会在水合或重渲染时把"非受控"节点统一推到容器末尾），就把它放回去；
-    // 若反复被抢，则退回子节点插入，让框架不再把它视为容器的多余兄弟。
-    guardSiblingPlacement(el, block);
-  }
+  // 无列宽/缩进限制时仍使用兄弟节点，便于 HTML→Markdown 转换器提取。
+  placeTranslationBlock(el, block);
   el.dataset.bilingualDone = 'done';
   appliedBlocks.set(el, block);
+  if (!trackedPairs.size) window.addEventListener('resize', syncTranslationPlacement);
   trackedPairs.add({ anchor: el, block });
   return true;
 }
 
 // 共享 observer 注册表：parent -> { observer, watchers: Map<anchor, {block, bounces}> }
 const parentObservers = new WeakMap();
+
+function stopSiblingPlacementGuard(anchor) {
+  const parent = anchor.parentNode;
+  const registry = parentObservers.get(parent);
+  if (!registry) return;
+  registry.watchers.delete(anchor);
+  if (!registry.watchers.size) {
+    registry.observer.disconnect();
+    parentObservers.delete(parent);
+  }
+}
 
 function guardSiblingPlacement(anchor, block) {
   const parent = anchor.parentNode;
@@ -607,7 +725,10 @@ function guardSiblingPlacement(anchor, block) {
         } else {
           // 反复被框架抢——改成 anchor 的子节点，让框架不再把它视作多余兄弟
           if (b.isConnected) b.remove();
-          if (a.isConnected) a.appendChild(b);
+          if (a.isConnected) {
+            insideBlocks.add(b);
+            a.appendChild(b);
+          }
           registry.watchers.delete(a);
         }
       }
@@ -982,6 +1103,8 @@ function clearAll() {
   runId++; // 作废在飞批次，避免旧译文在清除后又插回页面
   stopKeepAlive(true); // 清除是全局动作：连正在重试的单段一起收掉心跳
   if (repairTimer) { clearInterval(repairTimer); repairTimer = null; }
+  window.removeEventListener('resize', syncTranslationPlacement);
+  for (const { anchor } of trackedPairs) stopSiblingPlacementGuard(anchor);
   trackedPairs.clear(); // 否则守护逻辑会把刚清掉的译文又塞回来
   document.querySelectorAll('.bilingual-block, .bilingual-loading, .bilingual-failed').forEach(el => el.remove());
   document.querySelectorAll('[data-bilingual-done]').forEach(el => {

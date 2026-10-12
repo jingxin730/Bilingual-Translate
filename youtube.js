@@ -44,6 +44,11 @@ const state = {
   lastSourceText: '',
   domQueue: [],
   domFlushTimer: null,
+  domCurrentCue: null,
+  domLastTime: null,
+  downloadJob: null,
+  downloadMessage: '',
+  downloadFormat: 'srt',
   providers: {},
   provider: 'claude',
   targetLang: 'zh'
@@ -79,6 +84,7 @@ function onCapturedCaptions(videoId, url, text) {
   if (state.pickedTrack && languageCode && state.pickedTrack.languageCode !== languageCode) return;
   if (typeof text !== 'string') return;
   if (state.mode === 'cues') return; // 已经在用 cues 了
+  if (state.cache.get(videoId)?.mode === 'cues') return; // 保持已缓存分句和译文的对应关系
   console.log(`[双语翻译] 拦截到 YouTube 自身的字幕请求 (${text.length} 字符)`);
   const rawCues = parseAuto(text);
   if (!rawCues.length) return;
@@ -376,6 +382,40 @@ function renderPanel() {
   hint.textContent = t('ytCaptionUnavailableHint');
   panel.appendChild(hint);
 
+  const formatRow = document.createElement('div');
+  formatRow.className = 'bilingual-yt-panel-row';
+  const formatLabel = document.createElement('span');
+  formatLabel.className = 'bilingual-yt-panel-label';
+  formatLabel.textContent = t('ytDownloadFormat');
+  const formatSelect = document.createElement('select');
+  formatSelect.className = 'bilingual-yt-model-select bilingual-yt-download-format';
+  formatSelect.setAttribute('aria-label', t('ytDownloadFormat'));
+  for (const [value, label] of [['srt', 'SRT (.srt)'], ['md', 'Markdown (.md)']]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    formatSelect.appendChild(option);
+  }
+  formatSelect.value = state.downloadFormat;
+  formatSelect.addEventListener('change', () => {
+    state.downloadFormat = formatSelect.value === 'md' ? 'md' : 'srt';
+    state.downloadMessage = '';
+    refreshDownloadState();
+  });
+  formatRow.append(formatLabel, formatSelect);
+  panel.appendChild(formatRow);
+
+  const download = document.createElement('button');
+  download.type = 'button';
+  download.className = 'bilingual-yt-panel-btn bilingual-yt-download-btn';
+  download.addEventListener('click', downloadSubtitles);
+  panel.appendChild(download);
+  const downloadHint = document.createElement('div');
+  downloadHint.className = 'bilingual-yt-download-hint';
+  downloadHint.setAttribute('role', 'status');
+  downloadHint.setAttribute('aria-live', 'polite');
+  panel.appendChild(downloadHint);
+
   mountPanel(panel);
   refreshPanelCaptionState();
 }
@@ -394,6 +434,22 @@ function refreshPanelCaptionState() {
     : loading ? t('ytDetectingCaptions') : t('ytRetryCaptions');
   action.disabled = !state.active && !available && loading;
   panel.querySelector('.bilingual-yt-caption-hint').hidden = available || loading;
+  refreshDownloadState();
+  repositionPanel();
+}
+
+function refreshDownloadState() {
+  const button = state.panelEl?.querySelector('.bilingual-yt-download-btn');
+  if (!button) return;
+  const partial = state.cache.get(state.videoId)?.mode === 'dom';
+  const markdown = state.downloadFormat === 'md';
+  button.textContent = state.downloadJob ? t('ytDownloadPreparing')
+    : partial ? t(markdown ? 'ytDownloadWatchedMarkdown' : 'ytDownloadWatched')
+      : t(markdown ? 'ytDownloadMarkdown' : 'ytDownloadSubtitles');
+  button.disabled = !!state.downloadJob || !hasCaptionSource();
+  state.panelEl.querySelector('.bilingual-yt-download-format').disabled = !!state.downloadJob;
+  state.panelEl.querySelector('.bilingual-yt-download-hint').textContent = state.downloadMessage
+    || t(partial ? 'ytDownloadPartialHint' : 'ytDownloadHint');
   repositionPanel();
 }
 
@@ -531,13 +587,15 @@ function putCache(videoId, entry) {
 
 // 模型或目标语言变化后，保留已取得的字幕，只丢弃旧配置生成的译文。
 function resetTranslationCache() {
+  cancelSubtitleDownload();
+  const previous = state.cache.get(state.videoId);
   state.cache.clear();
-  if (!state.videoId || !state.mode) return;
+  if (!state.videoId || !previous) return;
 
-  if (state.mode === 'cues') {
+  if (previous.mode === 'cues') {
     putCache(state.videoId, {
       mode: 'cues',
-      cues: state.cues,
+      cues: previous.cues,
       translations: new Map(),
       batchState: new Map()
     });
@@ -548,6 +606,7 @@ function resetTranslationCache() {
 
   putCache(state.videoId, {
     mode: 'dom',
+    cues: previous.cues || [],
     textTranslations: new Map(),
     pending: new Map()
   });
@@ -713,35 +772,38 @@ function scheduleBatchTranslate(currentIdx) {
   if (!entry || entry.mode !== 'cues') return;
   const total = state.cues.length;
   const curBatch = Math.floor(currentIdx / BATCH_SIZE);
-  ensureBatch(entry, curBatch, total);
+  ensureBatch(entry, curBatch, total).catch(() => {});
   const lastInBatch = curBatch * BATCH_SIZE + BATCH_SIZE - 1;
   if (lastInBatch - currentIdx <= PRELOAD_AHEAD) {
-    ensureBatch(entry, curBatch + 1, total);
+    ensureBatch(entry, curBatch + 1, total).catch(() => {});
   }
 }
 
-async function ensureBatch(entry, batchId, total) {
+function ensureBatch(entry, batchId, total = entry.cues.length) {
   const start = batchId * BATCH_SIZE;
-  if (start >= total) return;
-  if (entry.batchState.get(batchId) === 'loading' || entry.batchState.get(batchId) === 'done') return;
+  if (start >= total || entry.batchState.get(batchId) === 'done') return Promise.resolve();
+  entry.batchRequests ||= new Map();
+  if (entry.batchRequests.has(batchId)) return entry.batchRequests.get(batchId);
   entry.batchState.set(batchId, 'loading');
 
   const end = Math.min(start + BATCH_SIZE, total);
-  const texts = state.cues.slice(start, end).map(c => c.text);
+  const texts = entry.cues.slice(start, end).map(c => c.text);
 
-  try {
-    const translations = await sendTranslateRequest(texts);
+  const request = sendTranslateRequest(texts).then(translations => {
     entry.translations.set(batchId, translations);
     entry.batchState.set(batchId, 'done');
-    const t = state.videoEl?.currentTime;
-    if (typeof t === 'number') renderCurrentCue(t);
-  } catch (err) {
+    const time = state.videoEl?.currentTime;
+    if (state.active && state.cache.get(state.videoId) === entry && typeof time === 'number') renderCurrentCue(time);
+  }).catch(err => {
     console.error('[双语翻译] 批次错误:', err.message);
     entry.batchState.set(batchId, 'error');
     setTimeout(() => {
       if (entry.batchState.get(batchId) === 'error') entry.batchState.delete(batchId);
     }, 5000);
-  }
+    throw err;
+  }).finally(() => entry.batchRequests.delete(batchId));
+  entry.batchRequests.set(batchId, request);
+  return request;
 }
 
 // ============================================================
@@ -775,10 +837,13 @@ function stopCaptionWatch() {
   state.lastSourceText = '';
   state.domQueue = [];
   state.domLastSettled = '';
+  state.domCurrentCue = null;
+  state.domLastTime = null;
 }
 
 function onCaptionChanged() {
   const text = getCurrentNativeText();
+  recordDomCue(text);
   if (text === state.lastSourceText) return;
   state.lastSourceText = text;
   renderDomMode(text);
@@ -794,6 +859,23 @@ function onCaptionChanged() {
       enqueueDomTranslation(state.lastSourceText);
     }
   }, DOM_SETTLE_MS);
+}
+
+// DOM 兜底没有完整轨道，记录实际展示的文本和视频时间，保留重复台词。
+function recordDomCue(text) {
+  const entry = state.cache.get(state.videoId);
+  const time = getVideoEl()?.currentTime;
+  if (entry?.mode !== 'dom' || !Number.isFinite(time)) return;
+  entry.cues ||= [];
+  const jumped = state.domLastTime !== null && (time < state.domLastTime || time - state.domLastTime > 1.5);
+  const current = state.domCurrentCue;
+  if (current && !jumped) current.end = Math.max(current.end, time);
+  if (jumped || current?.text !== text) {
+    state.domCurrentCue = text ? { start: time, end: time, text } : null;
+    if (state.domCurrentCue) entry.cues.push(state.domCurrentCue);
+    refreshDownloadState();
+  }
+  state.domLastTime = time;
 }
 
 function renderDomMode(sourceText) {
@@ -827,20 +909,25 @@ async function flushDomBatch() {
   const entry = state.cache.get(state.videoId);
   if (!entry) return;
 
-  batch.forEach(s => entry.pending.set(s, true));
   try {
-    const translations = await sendTranslateRequest(batch);
-    batch.forEach((src, i) => {
-      entry.textTranslations.set(src, translations[i] || '');
-      entry.pending.delete(src);
-    });
-    if (state.lastSourceText && entry.textTranslations.has(state.lastSourceText)) {
-      renderDomMode(state.lastSourceText);
-    }
+    await ensureDomTranslations(entry, batch);
   } catch (err) {
     console.warn('[双语翻译] DOM 批次翻译失败:', err.message);
-    batch.forEach(s => entry.pending.delete(s));
   }
+}
+
+async function ensureDomTranslations(entry, texts) {
+  const waiting = [...new Set(texts.map(text => entry.pending.get(text)).filter(Boolean))];
+  const missing = [...new Set(texts)].filter(text => !entry.textTranslations.get(text) && !entry.pending.has(text));
+  if (missing.length) {
+    const request = sendTranslateRequest(missing).then(translations => {
+      missing.forEach((text, i) => entry.textTranslations.set(text, translations[i]));
+      if (state.active && state.cache.get(state.videoId) === entry && state.lastSourceText) renderDomMode(state.lastSourceText);
+    }).finally(() => missing.forEach(text => entry.pending.delete(text)));
+    missing.forEach(text => entry.pending.set(text, request));
+    waiting.push(request);
+  }
+  await Promise.all(waiting);
 }
 
 // ============================================================
@@ -848,21 +935,193 @@ async function flushDomBatch() {
 // ============================================================
 function sendTranslateRequest(texts) {
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(
-      { action: 'translate', texts, provider: state.provider, targetLang: state.targetLang },
-      resp => {
-        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
-        if (resp?.error) return reject(new Error(resp.error));
-        resolve(resp?.translations || new Array(texts.length).fill(''));
-      }
-    );
+    const finish = (error, translations) => {
+      clearTimeout(timeout);
+      clearInterval(heartbeat);
+      if (error) reject(error);
+      else resolve(translations);
+    };
+    const timeout = setTimeout(() => finish(new Error(t('ytTranslationTimeout'))), 120000);
+    const heartbeat = setInterval(() => {
+      try { chrome.runtime.sendMessage({ action: 'keepAlive' }, () => { void chrome.runtime.lastError; }); } catch {}
+    }, 20000);
+    try {
+      chrome.runtime.sendMessage(
+        { action: 'translate', texts, provider: state.provider, targetLang: state.targetLang },
+        resp => {
+          if (chrome.runtime.lastError) return finish(new Error(chrome.runtime.lastError.message));
+          if (resp?.error) return finish(new Error(resp.error));
+          const translations = resp?.translations;
+          if (!Array.isArray(translations) || translations.length !== texts.length
+            || translations.some(text => typeof text !== 'string' || !text.trim())) {
+            return finish(new Error(t('ytTranslationIncomplete')));
+          }
+          finish(null, translations);
+        }
+      );
+    } catch (err) { finish(err); }
   });
+}
+
+// ============================================================
+// 下载：与实时字幕共用分句、批次和译文缓存
+// ============================================================
+function cancelSubtitleDownload() {
+  state.downloadJob = null;
+  state.downloadMessage = '';
+  refreshDownloadState();
+}
+
+function assertDownloadCurrent(job) {
+  if (state.downloadJob !== job || state.navigating || state.videoId !== job.videoId
+    || currentVideoId() !== job.videoId || state.provider !== job.provider || state.targetLang !== job.targetLang
+    || (job.entry && state.cache.get(job.videoId) !== job.entry)) {
+    throw new Error(t('ytDownloadCancelled'));
+  }
+}
+
+async function getDownloadEntry(job) {
+  let entry = state.cache.get(job.videoId);
+  if (entry?.cues?.length) return entry;
+  const track = state.pickedTrack;
+  if (track?.baseUrl) {
+    const response = await fetchCaptionsViaBridge(track.baseUrl);
+    assertDownloadCurrent(job);
+    entry = state.cache.get(job.videoId);
+    if (entry?.cues?.length) return entry;
+    if (response.ok) {
+      const cues = mergeIntoSentences(parseAuto(response.text));
+      if (cues.length) {
+        entry = { mode: 'cues', cues, translations: new Map(), batchState: new Map() };
+        putCache(job.videoId, entry);
+        return entry;
+      }
+    }
+  }
+  // 让播放器自行获取带认证的字幕，等待 bridge 截获完整数据。
+  requestNativeCaptions(track?.languageCode);
+  for (let attempt = 0; attempt < 40; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assertDownloadCurrent(job);
+    entry = state.cache.get(job.videoId);
+    if (entry?.cues?.length) return entry;
+  }
+  throw new Error(t('ytDownloadNoData'));
+}
+
+function formatSrtTime(seconds) {
+  const ms = Math.max(0, Math.round(seconds * 1000));
+  return `${String(Math.floor(ms / 3600000)).padStart(2, '0')}:${String(Math.floor(ms / 60000) % 60).padStart(2, '0')}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')},${String(ms % 1000).padStart(3, '0')}`;
+}
+
+function buildBilingualSrt(cues, translations, holdTail = false) {
+  const clean = text => text.replace(/\r\n?/g, '\n').replace(/\n\s*\n/g, '\n').trim();
+  return cues.map((cue, index) => {
+    const end = getSubtitleEnd(cues, index, holdTail);
+    return `${index + 1}\n${formatSrtTime(cue.start)} --> ${formatSrtTime(end)}\n${clean(cue.text)}\n${clean(translations[index])}\n`;
+  }).join('\n');
+}
+
+function getSubtitleEnd(cues, index, holdTail) {
+  // 实时模式保留 0.3 秒尾帧；下一句开始后立即换句，两种格式沿用此规则。
+  const cue = cues[index];
+  const nextStart = cues[index + 1]?.start ?? Infinity;
+  return Math.max(cue.start + 0.001, Math.min(cue.end + (holdTail ? 0.3 : 0), nextStart));
+}
+
+function getSubtitleTitle(videoId) {
+  return (document.querySelector('h1.ytd-watch-metadata')?.textContent || document.title || videoId).trim();
+}
+
+function buildBilingualMarkdown(cues, translations, job, partial) {
+  // 按纯文本导出，避免字幕中的 Markdown 或 HTML 被误渲染成标题、链接等。
+  const escape = text => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/[\\`*_{}\[\]()#+\-.!|~]/g, '\\$&');
+  const paragraph = text => text.replace(/\r\n?/g, '\n').trim().split('\n').map(escape).join('  \n');
+  const time = seconds => formatSrtTime(seconds).replace(',', '.');
+  const videoUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(job.videoId)}`;
+  const header = `# ${paragraph(getSubtitleTitle(job.videoId))}\n\n[${t('ytDownloadVideoLink')}](${videoUrl})\n\n`;
+  const scope = partial ? `> ${t('ytDownloadPartialHint')}\n\n` : '';
+  return header + scope + cues.map((cue, index) => {
+    const end = getSubtitleEnd(cues, index, !partial);
+    const link = `${videoUrl}&t=${Math.floor(cue.start)}s`;
+    return `## [${time(cue.start)} – ${time(end)}](${link})\n\n${paragraph(cue.text)}\n\n${paragraph(translations[index])}\n`;
+  }).join('\n---\n\n');
+}
+
+function saveSubtitleFile(content, job, partial) {
+  const title = getSubtitleTitle(job.videoId);
+  const safe = value => value.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[.\s]+$/g, '').slice(0, 100) || 'YouTube';
+  const filename = `${safe(title)}.${safe(job.videoId)}.${safe(job.targetLang)}.${partial ? 'watched.' : ''}bilingual.${job.format}`;
+  const markdown = job.format === 'md';
+  const url = URL.createObjectURL(new Blob([markdown ? '' : '\uFEFF', content], {
+    type: markdown ? 'text/markdown;charset=utf-8' : 'application/x-subrip;charset=utf-8'
+  }));
+  const link = document.createElement('a');
+  link.hidden = true;
+  link.href = url;
+  link.download = filename;
+  // 合成点击也会触发面板外点击检测，放进面板以保留下载进度和结果提示。
+  (state.panelEl || document.body).appendChild(link);
+  try { link.click(); }
+  finally {
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+}
+
+async function downloadSubtitles() {
+  if (state.downloadJob || !state.videoId || !hasCaptionSource()) return;
+  const job = {
+    videoId: state.videoId, provider: state.provider, targetLang: state.targetLang,
+    format: state.downloadFormat === 'md' ? 'md' : 'srt', entry: null
+  };
+  state.downloadJob = job;
+  state.downloadMessage = t('ytDownloadPreparing');
+  refreshDownloadState();
+  try {
+    const entry = await getDownloadEntry(job);
+    assertDownloadCurrent(job);
+    job.entry = entry;
+    // 下载期间播放继续推进，DOM 导出范围固定为点击时已记录的字幕。
+    const cues = entry.cues.map(cue => ({ ...cue })).filter(cue => Number.isFinite(cue.start)
+      && Number.isFinite(cue.end) && cue.start >= 0 && cue.end >= cue.start && cue.text);
+    if (!cues.length) throw new Error(t('ytDownloadNoData'));
+    // 完整轨道的索引必须与实时翻译缓存严格对齐。
+    if (entry.mode === 'cues' && cues.length !== entry.cues.length) throw new Error(t('ytDownloadInvalidData'));
+    if (entry.mode === 'dom') cues.sort((a, b) => a.start - b.start || a.end - b.end);
+    for (let start = 0; start < cues.length; start += BATCH_SIZE) {
+      assertDownloadCurrent(job);
+      if (entry.mode === 'cues') await ensureBatch(entry, start / BATCH_SIZE);
+      else await ensureDomTranslations(entry, cues.slice(start, start + BATCH_SIZE).map(cue => cue.text));
+      assertDownloadCurrent(job);
+      state.downloadMessage = `${t('ytDownloadPreparing')} ${Math.min(start + BATCH_SIZE, cues.length)}/${cues.length}`;
+      refreshDownloadState();
+    }
+    const translations = cues.map((cue, i) => entry.mode === 'cues'
+      ? entry.translations.get(Math.floor(i / BATCH_SIZE))?.[i % BATCH_SIZE] : entry.textTranslations.get(cue.text));
+    if (translations.some(text => typeof text !== 'string' || !text.trim())) throw new Error(t('ytTranslationIncomplete'));
+    assertDownloadCurrent(job);
+    const partial = entry.mode === 'dom';
+    const content = job.format === 'md' ? buildBilingualMarkdown(cues, translations, job, partial)
+      : buildBilingualSrt(cues, translations, !partial);
+    saveSubtitleFile(content, job, partial);
+    state.downloadMessage = t(entry.mode === 'dom' ? 'ytDownloadPartialComplete' : 'ytDownloadComplete');
+  } catch (err) {
+    if (state.downloadJob === job) state.downloadMessage = `${t('ytDownloadFailed')} ${err.message}`;
+  } finally {
+    if (state.downloadJob === job) {
+      state.downloadJob = null;
+      refreshDownloadState();
+    }
+  }
 }
 
 // ============================================================
 // SPA 导航
 // ============================================================
 function resetVideoContext(videoId) {
+  cancelSubtitleDownload();
   ++state.activationId;
   state.activationKey = null;
   state.videoId = videoId;

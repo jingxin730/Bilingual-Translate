@@ -114,7 +114,12 @@ html.bilingual-yt-active .ytp-caption-window-container {
   color: #64748b;
   cursor: not-allowed;
 }
-.bilingual-yt-caption-hint {
+.bilingual-yt-download-btn {
+  background: #1e293b;
+  border: 1px solid rgba(255,255,255,.2);
+}
+.bilingual-yt-caption-hint,
+.bilingual-yt-download-hint {
   max-width: 270px;
   margin-top: 10px;
   color: #94a3b8;

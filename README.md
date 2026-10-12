@@ -19,6 +19,7 @@ A Chrome extension that uses AI to provide bilingual side-by-side translation â€
 - Adds an icon button to the player's bottom-right control bar
 - One click to enable bilingual subtitles: original and translated text overlaid on the same frame
 - Automatically identify and translate YouTube subtitle data.
+- Download bilingual SRT or Markdown (.md) files using the same sentences, timing, and cached translations as playback
 - In-session caching: scrubbing back to a watched position shows cached translations instantly
 - Auto-resets on SPA video navigation, reuses model settings
 - Uses the same AI model and target language as web page translation
@@ -96,6 +97,8 @@ deepseek: {
 2. Click the icon button in the player controls (next to the gear icon)
 3. Confirm the AI model in the panel and click **Start translating subtitles**
 4. Bilingual subtitles appear at the bottom of the video â€” original on top, translation below
+
+Choose **SRT (.srt)** or **Markdown (.md)** under **Download format** in the YouTube panel, then click the download button to save one file with the original above its translation. Markdown includes the video title, video link, and timestamp links for easy reading and note taking. The download reuses the current model/language cache and translates unwatched sections of a complete caption track, showing progress while preparing. When only live DOM captions are available, the button says **Download watched subtitles** with the selected format and the file contains recorded viewing only, with `watched` in its name. Changing the video, model, or target language cancels preparation. Failed translations can be retried while completed batches stay cached.
 
 ## File Structure
 
