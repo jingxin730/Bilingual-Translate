@@ -26,6 +26,19 @@ function harness(hostname = 'www.bloomberg.com', respond = message => ({ transla
     const node = {
       nodeType: 1, tagName: tag.toUpperCase(), textContent: text, attrs: { ...attrs }, children: [],
       dataset: {}, parentNode: null, id: attrs.id || '', className: attrs.class || '',
+      get childNodes() {
+        if (this.nodeType === 3) return [];
+        if (!this.textContent) return this.children;
+        if (!this.fixtureText) {
+          const owner = this;
+          this.fixtureText = {
+            nodeType: 3, parentNode: owner, parentElement: owner,
+            get nodeValue() { return owner.textContent; },
+            get nextSibling() { return owner.children[0] || null; }
+          };
+        }
+        return [this.fixtureText, ...this.children];
+      },
       style: { setProperty(name, value) { this[name] = value; } },
       computed: { display: display || (['a', 'span'].includes(tag) ? 'inline' : 'block'), visibility: 'visible',
         maxWidth: 'none', fontSize: '16px', color: 'rgb(34, 34, 34)' },
@@ -40,6 +53,7 @@ function harness(hostname = 'www.bloomberg.com', respond = message => ({ transla
         return name === 'class' ? this.className : this.attrs[name] ?? null;
       },
       setAttribute(name, value) { this.attrs[name] = value; },
+      removeAttribute(name) { delete this.attrs[name]; },
       addEventListener() {},
       matches(selector) {
         return selector.split(',').some(part => {
@@ -60,7 +74,7 @@ function harness(hostname = 'www.bloomberg.com', respond = message => ({ transla
         return null;
       },
       contains(other) { return other === this || descendants(this).includes(other); },
-      querySelectorAll(selector) { return descendants(this).filter(child => child.matches(selector)); },
+      querySelectorAll(selector) { return descendants(this).filter(child => child.nodeType === 1 && child.matches(selector)); },
       querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
       appendChild(child) { return this.insertBefore(child, null); },
       insertBefore(child, next) {
@@ -98,10 +112,39 @@ function harness(hostname = 'www.bloomberg.com', respond = message => ({ transla
   const document = {
     body: element('body'),
     createElement: element,
+    createTextNode(text) {
+      const node = element('text', text);
+      node.nodeType = 3;
+      Object.defineProperty(node, 'nodeValue', { get() { return this.textContent; } });
+      return node;
+    },
+    createRange() {
+      let target, offset, after;
+      return {
+        setStart(node, index) { target = node; offset = index; after = false; },
+        setStartAfter(node) { target = node; after = true; },
+        collapse() {},
+        insertNode(anchor) {
+          const parent = target.parentNode;
+          if (after && parent.children.includes(target)) {
+            parent.insertBefore(anchor, target.nextSibling);
+            return;
+          }
+          const text = target.nodeValue;
+          const index = after ? text.length : offset;
+          const next = target.nextSibling;
+          if (parent.fixtureText === target) parent.textContent = text.slice(0, index);
+          else target.textContent = text.slice(0, index);
+          parent.insertBefore(anchor, next);
+          if (index < text.length) parent.insertBefore(document.createTextNode(text.slice(index)), next);
+        }
+      };
+    },
     querySelectorAll(selector) { return this.body.querySelectorAll(selector); },
     querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
     createTreeWalker(root, _type, filter) {
-      const texts = [root, ...descendants(root)].filter(n => n.textContent).map(n => ({ parentElement: n, nodeValue: n.textContent }));
+      const textNodes = node => node.nodeType === 3 ? [node] : node.childNodes.flatMap(textNodes);
+      const texts = textNodes(root);
       const accepted = texts.filter(n => filter.acceptNode(n) === 1);
       return { nextNode: () => accepted.shift() || null };
     }

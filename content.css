@@ -1,3 +1,9 @@
+/* 句末锚点不占布局空间；译文块独占一行，隐藏译文后恢复原文连续排版。 */
+.bilingual-x-anchor {
+  display: contents;
+  white-space: normal;
+}
+
 /* 译文块容器 */
 .bilingual-block {
   display: block;
@@ -20,6 +26,27 @@
   font-weight: normal;
   font-style: normal;
   letter-spacing: normal;
+}
+
+/* X 原文的 pre-wrap 空行会与译文块叠加；显示译文时统一由译文控制段间距。 */
+[data-bilingual-x-layout="compact"],
+[data-bilingual-x-layout="compact"] span {
+  white-space: normal !important;
+}
+
+[data-bilingual-x-layout="compact"] br {
+  display: none;
+}
+
+.bilingual-x-anchor > .bilingual-block {
+  margin: 0.12em 0 0.5em;
+  padding-left: 0;
+  border-left: 0;
+  line-height: 1.45;
+}
+
+.bilingual-x-anchor > .bilingual-block > .bilingual-text {
+  font-size: 0.94em;
 }
 
 /* loading 动画 */

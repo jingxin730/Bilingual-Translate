@@ -35,6 +35,105 @@ const MARKED_SUMMARY_QUERY = '[data-testid="flexcard-text"], [data-component="su
 // OpenWeb 的稳定正文标记；用户名、在线/输入状态和回复按钮都在正文之外。
 const OPENWEB_CONVERSATION_QUERY = '[data-spotim-module="conversation"]';
 const OPENWEB_MESSAGE_QUERY = '[data-spot-im-class="message-text"], [data-open-web-class="message-text"]';
+// X 的正文用 div/span + 行内链接拼装，不能依赖叶子 div 或把行内链接拆成标题。
+const X_POST_QUERY = '[data-testid="tweetText"]';
+const IS_X_PAGE = /(^|\.)(x|twitter)\.com$/i.test(location.hostname);
+
+function xPostBody(el) {
+  return IS_X_PAGE ? el.closest(X_POST_QUERY) : null;
+}
+
+const xSegments = new WeakMap();
+const xPosts = new Map();
+
+function removeXSegments(post) {
+  const record = xPosts.get(post);
+  if (!record) return;
+  for (const anchor of record.anchors) {
+    forgetTranslation(anchor);
+    anchor.remove();
+  }
+  post.removeAttribute('data-bilingual-x-layout');
+  xPosts.delete(post);
+}
+
+// 只插入句末锚点，不搬动原文或重建链接，保留 X 的事件和 React 节点。
+function prepareXSegments(post) {
+  const source = getVisibleText(post);
+  const previous = xPosts.get(post);
+  if (previous?.source === source && previous.anchors.every(anchor => anchor.isConnected)) return previous.anchors;
+  removeXSegments(post);
+  let text = '';
+  const leaves = [];
+  const links = [];
+  const newline = () => { if (text && !text.endsWith('\n')) text += '\n'; };
+  const visit = node => {
+    if (node.nodeType === 3) {
+      const start = text.length;
+      text += node.nodeValue;
+      leaves.push({ node, start, end: text.length });
+      return;
+    }
+    if (node.nodeType !== 1 || isOwnNode(node) || TEXT_SKIP_TAGS.has(node.tagName)) return;
+    if (node.tagName === 'BR') { text += '\n'; return; }
+    // X 会用 inline-flex div 包住每个股票代码和 @ 提及，标签本身不代表换段。
+    // 即使链接外壳的 display 是 flex，也必须作为所在句子的行内内容。
+    const display = window.getComputedStyle(node).display;
+    const linkWrapper = node.querySelector('a[href]') && linkTextRatio(node) === 1;
+    const block = node !== post && BLOCK_TAGS.has(node.tagName.toLowerCase()) &&
+      /^(block|flow-root|flex|grid|list-item)$/.test(display) && !linkWrapper;
+    if (block) newline();
+    const start = text.length;
+    for (const child of node.childNodes) visit(child);
+    if (node.tagName === 'A') links.push({ start, end: text.length });
+    if (block) newline();
+  };
+  visit(post);
+  const sentenceSplitter = new Intl.Segmenter(undefined, { granularity: 'sentence' });
+  const parts = [];
+  let offset = 0;
+  for (const line of text.split('\n')) {
+    let numberPrefix = '';
+    for (const { segment, index } of sentenceSplitter.segment(line)) {
+      // 编号“1. ”属于后面的句子，不能单独翻译。
+      if (/^\s*\d+[.)]\s*$/.test(segment)) { numberPrefix += segment; continue; }
+      const end = offset + index + segment.trimEnd().length;
+      const start = offset + index - numberPrefix.length;
+      numberPrefix = '';
+      if (segment.trim()) parts.push({ start, end });
+    }
+    offset += line.length + 1;
+  }
+  // 行内链接可能包含标点；不在链接中间插译文，以免译文也变成可点击文字。
+  const merged = [];
+  for (const part of parts) {
+    const previous = merged[merged.length - 1];
+    if (previous && links.some(link => previous.end > link.start && previous.end < link.end)) previous.end = part.end;
+    else merged.push({ ...part });
+  }
+  const anchors = [];
+  // 从后往前插入，Range 分裂 Text 节点后，前面的字符偏移仍有效。
+  for (const part of merged.reverse()) {
+    const leaf = leaves.find(item => item.start < part.end && item.end >= part.end);
+    if (!leaf) continue;
+    const anchor = document.createElement('span');
+    anchor.className = 'bilingual-x-anchor';
+    const range = document.createRange();
+    range.setStart(leaf.node, part.end - leaf.start);
+    range.collapse(true);
+    // 句末恰在链接/加粗等行内元素末尾时，将锚点放到元素外面。
+    let edge = leaf.node;
+    if (part.end === leaf.end) {
+      while (edge.parentNode !== post && edge.nextSibling === null) edge = edge.parentNode;
+      range.setStartAfter(edge);
+    }
+    range.insertNode(anchor);
+    xSegments.set(anchor, { post, source, text: text.slice(part.start, part.end).trim().replace(/\s+/g, ' ') });
+    anchors.unshift(anchor);
+  }
+  xPosts.set(post, { source, anchors });
+  return anchors;
+}
 
 function isHeadingElement(el) {
   if (/^H[1-6]$/.test(el.tagName) || el.getAttribute('role') === 'heading') return true;
@@ -227,6 +326,7 @@ const HEADLINE_LINK_MIN = 25;     // 文字长度下限
 const HEADLINE_LINK_WORDS = 4;    // 词数下限（中日文没有空格，另给长度兜底）
 const HEADLINE_LINK_LONG = 40;
 function isHeadlineLink(a) {
+  if (xPostBody(a)) return false;
   // 链接里还套着链接 → 这是卡片容器而非单条标题，交给它内部的元素去处理
   if (a.querySelector('a[href]')) return false;
   // 标题标签自己就是候选（isHeading 放行），不必把里面的链接再收一遍
@@ -323,11 +423,13 @@ function isOwnNode(node) {
   const cls = node.classList;
   return !!cls && (cls.contains('bilingual-block') ||
     cls.contains('bilingual-loading') || cls.contains('bilingual-failed') ||
-    cls.contains('bilingual-styles'));
+    cls.contains('bilingual-styles') || cls.contains('bilingual-x-anchor'));
 }
 
 // 提取元素的可见文本（跳过 script/style 与我们自己插入的节点）
 function getVisibleText(el) {
+  const segment = xSegments.get(el);
+  if (segment) return getVisibleText(segment.post) === segment.source ? segment.text : '';
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       let p = node.parentElement;
@@ -381,8 +483,12 @@ function getTranslatableElements() {
 
   function tryAdd(el) {
     if (seen.has(el)) return;
-    if (el.closest('.bilingual-block')) return;
+    if (el.closest('.bilingual-block, .bilingual-loading, .bilingual-failed')) return;
     if (el.closest('[contenteditable="true"], [role="textbox"]')) return;
+    const postBody = xPostBody(el);
+    // X 正文只收句末锚点，避免外层整帖或内层链接再翻译一次。
+    if (postBody && !xSegments.has(el)) return;
+    const isPost = xSegments.has(el);
     const isComment = commentRoots.has(el.getRootNode?.()) || !!el.closest(OPENWEB_CONVERSATION_QUERY);
     // 只收评论正文：同一文档/嵌套 Shadow DOM 中也不能把姓名、时间、操作区
     // 或包含它们的整张回复卡片当作正文（短回复如 lol 应单独翻译）。
@@ -450,20 +556,30 @@ function getTranslatableElements() {
     if (!isHeading && !isSummary && !isTitleLink && wrappingLink && !cardTextElements.has(el)) { drop('链接内'); return; }
 
     const text = getVisibleText(el);
-    if (text.length < (isComment ? 2 : MIN_LENGTH)) { stats.太短++; return; }
+    if (text.length < (isComment || isPost ? 2 : MIN_LENGTH)) { stats.太短++; return; }
     if (isMostlyChinese(text)) { drop('中文', text); return; }
-    if (!isComment && isCapsLabel(text)) { drop('全大写', text); return; }
+    if (!isComment && !isPost && isCapsLabel(text)) { drop('全大写', text); return; }
     if (isBoilerplate(text)) { drop('样板文字', text); return; }
     if (isDataStrip(text)) { drop('数字条', text); return; }
     // 标题里只包着一个链接（<h3><a>标题</a></h3>）是最常见的卡片写法，链接占比
     // 必然是 100%，但它是标题不是导航条 —— 内部有多个链接才算导航。
     const isSelfLinkHeading = isHeading && el.querySelectorAll('a[href]').length === 1;
-    if (!isSelfLinkHeading && !isSummary && linkTextRatio(el) > LINK_RATIO_MAX) { drop('链接密度', text); return; }
-    const hidden = hiddenReason(el);
+    if (!isPost && !isSelfLinkHeading && !isSummary && linkTextRatio(el) > LINK_RATIO_MAX) { drop('链接密度', text); return; }
+    const hidden = hiddenReason(isPost ? postBody : el);
     if (hidden) { drop(hidden, text); return; }
 
     seen.add(el);
     result.push(el);
+  }
+
+  if (IS_X_PAGE) {
+    for (const post of xPosts.keys()) if (!post.isConnected) removeXSegments(post);
+    translationNodes(X_POST_QUERY).forEach(post => {
+      // 不改动隐藏内容、导航或输入框。
+      if (excludedReason(post, false) || hiddenReason(post) ||
+          post.closest('[contenteditable="true"], [role="textbox"]')) return;
+      prepareXSegments(post).forEach(tryAdd);
+    });
   }
 
   // 第一遍：语义化标签
@@ -585,6 +701,7 @@ function forgetTranslation(anchor) {
 // 普通 block 布局也可能只让原文段落居中限宽（如 Bloomberg），而父容器占满页面。
 // 这种情况下兄弟译文不会继承段落的列宽、缩进和响应式样式，必须留在原文内部。
 function shouldAppendTranslationInside(el) {
+  if (xSegments.has(el)) return true;
   const parent = el.parentElement || el.getRootNode?.().host;
   const parentStyle = window.getComputedStyle(parent);
   if (/^(inline-)?(grid|flex)$/.test(parentStyle.display)) return true;
@@ -784,6 +901,8 @@ function applyTranslation(el, text) {
   appliedSources.set(el, source);
   if (!trackedPairs.size) window.addEventListener('resize', syncTranslationPlacement);
   trackedPairs.add({ anchor: el, block });
+  const segment = xSegments.get(el);
+  if (segment && pageState.visible) segment.post.setAttribute('data-bilingual-x-layout', 'compact');
   return true;
 }
 
@@ -1321,6 +1440,11 @@ function toggleVisibility(visible) {
   translationNodes('.bilingual-block').forEach(el => {
     el.style.display = visible ? '' : 'none';
   });
+  for (const [post, record] of xPosts) {
+    if (visible && record.anchors.some(anchor => appliedBlocks.has(anchor))) {
+      post.setAttribute('data-bilingual-x-layout', 'compact');
+    } else post.removeAttribute('data-bilingual-x-layout');
+  }
 }
 
 function clearAll() {
@@ -1331,6 +1455,7 @@ function clearAll() {
   window.removeEventListener('resize', syncTranslationPlacement);
   for (const { anchor } of trackedPairs) stopSiblingPlacementGuard(anchor);
   trackedPairs.clear(); // 否则守护逻辑会把刚清掉的译文又塞回来
+  for (const post of xPosts.keys()) removeXSegments(post);
   translationNodes('.bilingual-block, .bilingual-loading, .bilingual-failed').forEach(el => el.remove());
   translationNodes('[data-bilingual-done]').forEach(el => {
     delete el.dataset.bilingualDone;
