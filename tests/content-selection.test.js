@@ -1,84 +1,9 @@
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
 const test = require('node:test');
-const vm = require('node:vm');
+const { harness } = require('./helpers/content-harness');
 
-const code = fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
 const title = 'Smart Ring Maker Oura Becomes Latest Company to Delay Its US IPO';
 const summary = 'The wearable tech startup and its shareholders were looking to raise funds in the US IPO.';
-
-function harness(hostname = 'www.bloomberg.com') {
-  function descendants(node) {
-    return node.children.flatMap(child => [child, ...descendants(child)]);
-  }
-  function element(tag, text = '', attrs = {}, display) {
-    const node = {
-      tagName: tag.toUpperCase(), textContent: text, attrs: { ...attrs }, children: [],
-      dataset: {}, parentElement: null, id: attrs.id || '', className: attrs.class || '',
-      computed: { display: display || (['a', 'span'].includes(tag) ? 'inline' : 'block'), visibility: 'visible' },
-      get classList() { return { contains: name => this.className.split(' ').includes(name) }; },
-      getAttribute(name) {
-        if (name === 'data-bilingual-done') return this.dataset.bilingualDone ?? null;
-        return name === 'class' ? this.className : this.attrs[name] ?? null;
-      },
-      matches(selector) {
-        return selector.split(',').some(part => {
-          const s = part.trim();
-          if (s.startsWith('.')) return this.classList.contains(s.slice(1));
-          const match = s.match(/^([a-z0-9]+)?(?:\[([\w-]+)(\*?=)?(?:"([^"]*)")?\])?$/i);
-          if (!match) throw new Error(`Unsupported fixture selector: ${s}`);
-          const [, tagName, attr, op, value] = match;
-          if (tagName && this.tagName !== tagName.toUpperCase()) return false;
-          if (!attr) return true;
-          const actual = this.getAttribute(attr);
-          return op === '*=' ? actual?.includes(value) : op === '=' ? actual === value : actual !== null;
-        });
-      },
-      closest(selector) {
-        for (let n = this; n; n = n.parentElement) if (n.matches(selector)) return n;
-        return null;
-      },
-      contains(other) { return other === this || descendants(this).includes(other); },
-      querySelectorAll(selector) { return descendants(this).filter(child => child.matches(selector)); },
-      querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
-      appendChild(child) { child.parentElement = this; this.children.push(child); return child; },
-      getBoundingClientRect: () => ({ left: 0, right: 600, width: 600, height: 40 }),
-      compareDocumentPosition(other) {
-        const nodes = descendants(document.body);
-        return nodes.indexOf(this) < nodes.indexOf(other) ? 4 : 2;
-      }
-    };
-    return node;
-  }
-  const document = {
-    body: element('body'),
-    querySelectorAll(selector) { return this.body.querySelectorAll(selector); },
-    createTreeWalker(root, _type, filter) {
-      const texts = [root, ...descendants(root)].filter(n => n.textContent).map(n => ({ parentElement: n, nodeValue: n.textContent }));
-      const accepted = texts.filter(n => filter.acceptNode(n) === 1);
-      return { nextNode: () => accepted.shift() || null };
-    }
-  };
-  const logs = [];
-  const context = {
-    document, location: { hostname },
-    window: { getComputedStyle: node => node.computed },
-    console: { log: message => logs.push(message), warn: message => logs.push(message) },
-    Node: { DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_PRECEDING: 2 },
-    NodeFilter: { SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2 },
-    chrome: { runtime: { onMessage: { addListener() {} } } }
-  };
-  vm.runInNewContext(code.replace(/\n} \/\/ end non-youtube guard/, `
-    globalThis.api = { getTranslatableElements, getVisibleText };
-  } // end non-youtube guard`), context);
-  const root = document.body.appendChild(element('main'));
-  return {
-    element, root, logs,
-    selected: () => Array.from(context.api.getTranslatableElements()),
-    texts: () => Array.from(context.api.getTranslatableElements(), el => context.api.getVisibleText(el))
-  };
-}
 
 for (const [tag, attrs] of [
   ['span', { class: 'story-card-module__headline__large' }],

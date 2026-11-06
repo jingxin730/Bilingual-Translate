@@ -12,9 +12,11 @@ function harness() {
   const allNodes = [];
   function element(tag = 'div', left = 0, width = 1000) {
     const node = {
-      tagName: tag.toUpperCase(), children: [], style: {}, dataset: {}, className: '',
+      tagName: tag.toUpperCase(), children: [],
+      style: { setProperty(name, value, priority) { this[name] = value; this[`${name}Priority`] = priority; } },
+      dataset: {}, className: '',
       parentNode: null, textContent: '', connected: false,
-      computed: { display: 'block', maxWidth: 'none', fontSize: '20px' },
+      computed: { display: 'block', maxWidth: 'none', fontSize: '20px', color: 'rgb(0, 0, 0)' },
       rect: { left, right: left + width, width, height: 40 },
       get parentElement() { return this.parentNode; },
       get isConnected() { return this.parentNode ? this.parentNode.isConnected : this.connected; },
@@ -96,6 +98,24 @@ function harness() {
     block: () => allNodes.find(node => node.className === 'bilingual-block'),
     mutate: () => observers.filter(observer => observer.active).forEach(observer => observer.callback())
   };
+}
+
+for (const [theme, color] of [['dark', 'rgb(255, 255, 255)'], ['light', 'rgb(34, 34, 34)']]) {
+  test(`${theme} paragraphs use their own text color even when the parent has a different color`, () => {
+    for (const inside of [false, true]) {
+      const h = harness();
+      h.anchor.computed.color = color;
+      if (inside) h.parent.computed.display = 'grid';
+      h.applyTranslation(h.anchor, '译文在对应背景下应清晰可读');
+      assert.equal(h.block().parentNode, inside ? h.anchor : h.parent);
+      const text = h.block().querySelector('.bilingual-text');
+      assert.equal(text.style.color, color);
+      assert.equal(text.style.colorPriority, 'important');
+      h.block().remove();
+      h.repairLostBlocks();
+      assert.equal(text.style.color, color);
+    }
+  });
 }
 
 test('centered article paragraphs retain their own reading column', () => {

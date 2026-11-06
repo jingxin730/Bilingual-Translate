@@ -32,6 +32,9 @@ const MARKED_HEADLINE_QUERY = '[role="heading"], [data-component="headline"], [d
 // WSJ 的副标题是 flexcard-text 段落，外层是 aria-hidden="true" 的冗余链接；
 // 段落视觉上正常显示，应按副标题收集，不能当作导航或隐藏链接跳过。
 const MARKED_SUMMARY_QUERY = '[data-testid="flexcard-text"], [data-component="summary"], [data-testid="summary"], [class*="summary"], [class*="Summary"], [class*="subheadline"], [class*="subHeadline"], [class*="standfirst"]';
+// OpenWeb 的稳定正文标记；用户名、在线/输入状态和回复按钮都在正文之外。
+const OPENWEB_CONVERSATION_QUERY = '[data-spotim-module="conversation"]';
+const OPENWEB_MESSAGE_QUERY = '[data-spot-im-class="message-text"], [data-open-web-class="message-text"]';
 
 function isHeadingElement(el) {
   if (/^H[1-6]$/.test(el.tagName) || el.getAttribute('role') === 'heading') return true;
@@ -61,7 +64,7 @@ const EXCLUDED_TAGS = new Set(['nav', 'footer', 'aside', 'script', 'style', 'but
 
 // 排除这些 ARIA 区域
 const EXCLUDED_ROLES = new Set(['navigation', 'banner', 'contentinfo', 'complementary',
-  'menu', 'menubar', 'tablist', 'search', 'dialog']);
+  'menu', 'menubar', 'tablist', 'search', 'dialog', 'textbox']);
 
 // 提取文本时跳过这些子节点（避免广告位的 script 源码被当成正文）
 const TEXT_SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE']);
@@ -90,9 +93,54 @@ let pageState = {
 
 // 翻译轮次号：停止后重译、清除时递增，让上一轮在飞的批次自动作废
 let runId = 0;
+let serviceFailure = null; // 当前轮次的服务故障：不再对后续几十批重复请求同一故障接口
 
 // 最后一次翻译用的模型/目标语言，单段重试按钮复用它
 let lastRun = { provider: 'claude', targetLang: 'zh' };
+
+// 评论组件可能挂在 Shadow DOM 中；普通 document.querySelectorAll 看不到它们。
+const shadowRoots = new Set();
+function translationRoots() {
+  return [document, ...shadowRoots].filter(root => !root.host || root.host.isConnected);
+}
+
+function discoverShadowRoots() {
+  for (const root of shadowRoots) if (!root.host.isConnected) shadowRoots.delete(root);
+  const visit = root => {
+    root.querySelectorAll('*').forEach(el => {
+      if (!el.shadowRoot) return;
+      shadowRoots.add(el.shadowRoot);
+      visit(el.shadowRoot);
+    });
+  };
+  visit(document);
+}
+
+function translationNodes(selector) {
+  return translationRoots().flatMap(root => Array.from(root.querySelectorAll(selector)));
+}
+
+function composedParent(el) {
+  return el.parentElement || el.getRootNode?.().host || null;
+}
+
+function closestAcrossShadowRoots(el, selector) {
+  for (let node = el; node; node = node.getRootNode?.().host) {
+    const match = node.closest(selector);
+    if (match) return match;
+  }
+  return null;
+}
+
+function ensureTranslationStyles(el) {
+  const root = el.getRootNode?.();
+  if (!root?.host || root.querySelector('.bilingual-styles')) return;
+  const link = document.createElement('link');
+  link.className = 'bilingual-styles';
+  link.rel = 'stylesheet';
+  link.href = chrome.runtime.getURL('content.css');
+  root.appendChild(link);
+}
 
 // header 有两种：站点顶栏（不翻）与文章标题区（要翻——WSJ 的主标题/副标题就在这里）。
 // 判据：内部有一个够长、且不是链接的 h1/h2 —— 站点顶栏的 h1 通常只是短 logo 文字。
@@ -119,8 +167,9 @@ function excludedReason(el, allowHeader) {
   // class 猜测是"长得像站点外壳就不翻"的模糊规则，只在正文容器之外可靠。
   // 正文容器内命中基本都是误伤：WSJ 就用 class="paywall" 包住正文的付费部分。
   const softRules = !el.closest(CONTENT_ROOT_SEL);
-  let node = el.parentElement;
+  let node = composedParent(el);
   while (node && node !== document.body) {
+    if (node.isContentEditable || node.getAttribute?.('contenteditable') === 'true') return '评论输入区';
     const tag = node.tagName.toLowerCase();
     if (tag === 'header') {
       if (!allowHeader && !isArticleHeader(node)) return '站点 <header>';
@@ -136,7 +185,7 @@ function excludedReason(el, allowHeader) {
       const hit = cls && cls.match(SHELL_CLASS_RE);
       if (hit) return `class 含 "${hit[0]}"`;
     }
-    node = node.parentElement;
+    node = composedParent(node);
   }
   return null;
 }
@@ -244,6 +293,11 @@ function hiddenReason(el) {
   const cs = window.getComputedStyle(el);
   // 不看 opacity：有站点让正文滚动淡入，初始 opacity 为 0
   if (cs.display === 'none' || cs.visibility === 'hidden') return '隐藏';
+  for (let parent = composedParent(el); parent; parent = composedParent(parent)) {
+    if (parent.hidden) return '隐藏';
+    const style = window.getComputedStyle(parent);
+    if (style.display === 'none' || style.visibility === 'hidden') return '隐藏';
+  }
   const rect = el.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return '零尺寸';
   return null;
@@ -268,7 +322,8 @@ function isLeafDiv(el) {
 function isOwnNode(node) {
   const cls = node.classList;
   return !!cls && (cls.contains('bilingual-block') ||
-    cls.contains('bilingual-loading') || cls.contains('bilingual-failed'));
+    cls.contains('bilingual-loading') || cls.contains('bilingual-failed') ||
+    cls.contains('bilingual-styles'));
 }
 
 // 提取元素的可见文本（跳过 script/style 与我们自己插入的节点）
@@ -311,6 +366,9 @@ function findHeadline() {
 }
 
 function getTranslatableElements() {
+  discoverShadowRoots();
+  const commentRoots = new Set(translationRoots().filter(root => root.host &&
+    (closestAcrossShadowRoots(root.host, OPENWEB_CONVERSATION_QUERY) || root.querySelector(OPENWEB_CONVERSATION_QUERY))));
   const seen = new Set();
   const result = [];
   const cardTextElements = new WeakSet();
@@ -324,6 +382,11 @@ function getTranslatableElements() {
   function tryAdd(el) {
     if (seen.has(el)) return;
     if (el.closest('.bilingual-block')) return;
+    if (el.closest('[contenteditable="true"], [role="textbox"]')) return;
+    const isComment = commentRoots.has(el.getRootNode?.()) || !!el.closest(OPENWEB_CONVERSATION_QUERY);
+    // 只收评论正文：同一文档/嵌套 Shadow DOM 中也不能把姓名、时间、操作区
+    // 或包含它们的整张回复卡片当作正文（短回复如 lol 应单独翻译）。
+    if (isComment && !closestAcrossShadowRoots(el, OPENWEB_MESSAGE_QUERY)) return;
 
     // 拦掉一个候选。若它是成段长文本，几乎必然是误伤 —— 单独打出来，这样
     // "某段为什么没翻译"不用再靠猜（太短的不记：<40 字符不一定是正文段落）。
@@ -339,6 +402,13 @@ function getTranslatableElements() {
       }
     };
 
+    if (el.dataset.bilingualDone) {
+      // “See more”或评论编辑会复用同一节点；不能把旧的截断译文当作已完成。
+      if (el.dataset.bilingualDone === 'done' && appliedSources.has(el) &&
+          appliedSources.get(el) !== getVisibleText(el)) {
+        forgetTranslation(el);
+      }
+    }
     if (el.dataset.bilingualDone) {
       // 'done' 但译文块已被框架删掉 → 用户看到的就是"没翻译"，放行重翻
       if (el.dataset.bilingualDone === 'done' && translationLost(el)) {
@@ -356,8 +426,9 @@ function getTranslatableElements() {
 
     // 站点外壳（顶栏、行情条、推广条）总在文章主标题之上，一律不翻；
     // 正文容器内的元素不受此限，避免误伤没有典型页头的页面
-    if (headline && el !== headline &&
-        (headline.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING) &&
+    const headlinePosition = headline?.compareDocumentPosition(el) || 0;
+    if (headline && el !== headline && !(headlinePosition & Node.DOCUMENT_POSITION_DISCONNECTED) &&
+        (headlinePosition & Node.DOCUMENT_POSITION_PRECEDING) &&
         !el.closest(CONTENT_ROOT_SEL)) { stats.标题之上++; return; }
 
     // 标题标签一律视为正文，不受"整块在链接里就是导航项"的限制：列表页/首页的
@@ -379,9 +450,9 @@ function getTranslatableElements() {
     if (!isHeading && !isSummary && !isTitleLink && wrappingLink && !cardTextElements.has(el)) { drop('链接内'); return; }
 
     const text = getVisibleText(el);
-    if (text.length < MIN_LENGTH) { stats.太短++; return; }
+    if (text.length < (isComment ? 2 : MIN_LENGTH)) { stats.太短++; return; }
     if (isMostlyChinese(text)) { drop('中文', text); return; }
-    if (isCapsLabel(text)) { drop('全大写', text); return; }
+    if (!isComment && isCapsLabel(text)) { drop('全大写', text); return; }
     if (isBoilerplate(text)) { drop('样板文字', text); return; }
     if (isDataStrip(text)) { drop('数字条', text); return; }
     // 标题里只包着一个链接（<h3><a>标题</a></h3>）是最常见的卡片写法，链接占比
@@ -396,15 +467,15 @@ function getTranslatableElements() {
   }
 
   // 第一遍：语义化标签
-  document.querySelectorAll(QUERY).forEach(tryAdd);
+  translationNodes(QUERY).forEach(tryAdd);
 
   // 补充非 hN 标签的新闻标题，保留它自己的字号和所在位置。
-  document.querySelectorAll(MARKED_HEADLINE_QUERY).forEach(el => {
+  translationNodes(MARKED_HEADLINE_QUERY).forEach(el => {
     if (isHeadingElement(el)) tryAdd(el);
   });
 
   // 单独收集副标题，不依赖外层卡片或标题本轮是否被选中；补漏轮也能补上。
-  document.querySelectorAll(MARKED_SUMMARY_QUERY).forEach(summary => {
+  translationNodes(MARKED_SUMMARY_QUERY).forEach(summary => {
     if (isSummaryElement(summary)) {
       tryAdd(summary);
     } else {
@@ -415,14 +486,14 @@ function getTranslatableElements() {
   });
 
   // 第二遍：叶子 div（Modern 网站如经济学人用 div 做段落）
-  document.querySelectorAll('div').forEach(el => {
+  translationNodes('div').forEach(el => {
     if (!isLeafDiv(el)) return;
     tryAdd(el);
   });
 
   // 第三遍：卡片标题链接（首页/列表页的主标题）。若链接内部已经有 hN 之类的
   // 候选被选中，下面的"外层让位内层"会把这个 <a> 去掉，不会翻两遍。
-  document.querySelectorAll('a[href]').forEach(el => {
+  translationNodes('a[href]').forEach(el => {
     if (isHeadlineLink(el)) tryAdd(el);
   });
 
@@ -453,8 +524,11 @@ function getTranslatableElements() {
   }
 
   // 按文档顺序排列：首批就是标题和开头段落，译文自上而下逐段出现
-  result.sort((a, b) =>
-    (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1);
+  result.sort((a, b) => {
+    const position = a.compareDocumentPosition(b);
+    return position & Node.DOCUMENT_POSITION_DISCONNECTED ? 0 :
+      position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+  });
 
   // 外层容器让位给更细的内层元素（如 li 里还有 p），避免同段文字翻两遍
   const kept = new Set(result);
@@ -495,13 +569,23 @@ function getTranslatableElements() {
 // 注意 grid/flex 站点（WSJ）走的是 appendChild 分支，那条路径上没有
 // guardSiblingPlacement 守护，所以必须靠这里兜住。
 const appliedBlocks = new WeakMap();   // anchor -> block，按元素查
+const appliedSources = new WeakMap();  // anchor -> 翻译时的原文，识别展开全文/编辑
 const trackedPairs = new Set();        // {anchor, block}，可遍历，用于批量修复
 const insideBlocks = new WeakSet();    // 内部插入过的块在恢复/窗口缩放时保持内部插入
+
+function forgetTranslation(anchor) {
+  stopSiblingPlacementGuard(anchor);
+  for (const pair of trackedPairs) if (pair.anchor === anchor) trackedPairs.delete(pair);
+  appliedBlocks.get(anchor)?.remove();
+  appliedBlocks.delete(anchor);
+  appliedSources.delete(anchor);
+  delete anchor.dataset.bilingualDone;
+}
 
 // 普通 block 布局也可能只让原文段落居中限宽（如 Bloomberg），而父容器占满页面。
 // 这种情况下兄弟译文不会继承段落的列宽、缩进和响应式样式，必须留在原文内部。
 function shouldAppendTranslationInside(el) {
-  const parent = el.parentElement;
+  const parent = el.parentElement || el.getRootNode?.().host;
   const parentStyle = window.getComputedStyle(parent);
   if (/^(inline-)?(grid|flex)$/.test(parentStyle.display)) return true;
 
@@ -533,7 +617,7 @@ function placeTranslationBlock(anchor, block) {
 
 function syncTranslationPlacement() {
   for (const { anchor, block } of trackedPairs) {
-    if (!anchor.isConnected || !anchor.parentElement || !block.isConnected || insideBlocks.has(block)) continue;
+    if (!anchor.isConnected || !anchor.parentNode || !block.isConnected || insideBlocks.has(block)) continue;
     if (shouldAppendTranslationInside(anchor)) placeTranslationBlock(anchor, block);
   }
 }
@@ -556,7 +640,7 @@ function repairLostBlocks() {
     const { anchor, block } = pair;
     if (!anchor.isConnected) { trackedPairs.delete(pair); continue; }  // 原文都没了，交给补漏轮
     if (block.isConnected) continue;
-    const parent = anchor.parentElement;
+    const parent = anchor.parentNode;
     if (!parent) continue;
     placeTranslationBlock(anchor, block);
     repaired++;
@@ -649,6 +733,7 @@ function stopKeepAlive(token) {
 }
 
 function showLoading(el) {
+  ensureTranslationStyles(el);
   const span = document.createElement('span');
   span.className = 'bilingual-loading';
   span.setAttribute('aria-hidden', 'true');
@@ -661,7 +746,7 @@ function applyTranslation(el, text) {
   el.querySelector('.bilingual-loading')?.remove();
 
   // 页面在翻译期间重建了这个节点（React 水合、懒加载），写进去也看不见 —— 交给补漏轮次
-  if (!el.isConnected || !el.parentElement) {
+  if (!el.isConnected || !el.parentNode) {
     el.dataset.bilingualDone = 'detached';
     return false;
   }
@@ -671,14 +756,23 @@ function applyTranslation(el, text) {
     return false;
   }
 
+  ensureTranslationStyles(el);
+
+  const source = getVisibleText(el);
+  if (appliedBlocks.has(el)) forgetTranslation(el);
   const block = document.createElement('div');
   block.className = 'bilingual-block';
   block.setAttribute('aria-label', '译文');
+  if (!pageState.visible) block.style.display = 'none';
+  const sourceStyle = window.getComputedStyle(el);
   // 译文字号跟随原文
-  block.style.fontSize = window.getComputedStyle(el).fontSize;
+  block.style.fontSize = sourceStyle.fontSize;
 
   const span = document.createElement('div');
   span.className = 'bilingual-text';
+  // 兄弟译文继承的是外层容器，未必是原文颜色（如 WSJ 黑底白字段落）。
+  // 直接采用原文的实际颜色，并避免站点针对 div 的规则把译文覆盖成黑色。
+  span.style.setProperty('color', sourceStyle.color, 'important');
   span.textContent = text;
 
   block.appendChild(span);
@@ -687,6 +781,7 @@ function applyTranslation(el, text) {
   placeTranslationBlock(el, block);
   el.dataset.bilingualDone = 'done';
   appliedBlocks.set(el, block);
+  appliedSources.set(el, source);
   if (!trackedPairs.size) window.addEventListener('resize', syncTranslationPlacement);
   trackedPairs.add({ anchor: el, block });
   return true;
@@ -855,7 +950,7 @@ function markError(el, message) {
 
 // 带客户端超时：网关 524 要等满 100s 才回，白占一个工作协程。
 // 主动在 60s 放弃并重试，通常重试很快就成功，最坏情况也被限制住。
-// （后台的 fetch 无法从这里中止，那次请求会继续跑完但结果被丢弃）
+// 后台提前 5s 中止 fetch，给错误消息留出返回时间；这里仍保留消息通道超时兜底。
 async function sendTranslateRequest(texts, provider, targetLang, timeout = REQUEST_TIMEOUT) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -866,7 +961,7 @@ async function sendTranslateRequest(texts, provider, targetLang, timeout = REQUE
     }, timeout);
 
     chrome.runtime.sendMessage(
-      { action: 'translate', texts, provider, targetLang },
+      { action: 'translate', texts, provider, targetLang, timeoutMs: Math.max(1000, timeout - 5000) },
       resp => {
         if (settled) return;
         settled = true;
@@ -877,6 +972,18 @@ async function sendTranslateRequest(texts, provider, targetLang, timeout = REQUE
       }
     );
   });
+}
+
+function isServiceFailure(message) {
+  // 缩小文本无法修复服务繁忙、认证/配置错误、网络断连或反复请求超时。
+  return /(?:API|Gemini) (?:401|402|403|404|429|5\d\d)\b|请求超时|Failed to fetch|fetch failed|NetworkError|Extension context invalidated|message port closed|Receiving end does not exist/i.test(message);
+}
+
+function serviceFailureMessage(provider, message) {
+  if (/(?:API|Gemini) (?:429|503)\b/.test(message)) {
+    return `${provider} 翻译服务繁忙，已暂停后续请求。请切换模型或稍后重试。${message}`;
+  }
+  return `${provider} 翻译服务请求失败，已暂停后续请求。请检查模型配置或网络后重试。${message}`;
 }
 
 // 首批小、后续大：首屏译文来得快，整体请求数又不至于太多
@@ -911,6 +1018,7 @@ async function processBatch(batch, provider, targetLang, myRun, label, canSplit 
 
   for (let attempt = 0; ; attempt++) {
     try {
+      if (serviceFailure) throw new Error(serviceFailure);
       const translations = await sendTranslateRequest(texts, provider, targetLang);
       if (myRun !== runId) return discardBatch(batch);
 
@@ -918,6 +1026,12 @@ async function processBatch(batch, provider, targetLang, myRun, label, canSplit 
       const missing = [];   // 模型没返回译文的段落（编号没对齐 → 空串）
       live.forEach((el, j) => {
         try {
+          if (getVisibleText(el) !== texts[j]) {
+            // 请求期间评论已展开/修改；放回候选池，下一轮翻译最新内容。
+            discardBatch([el]);
+            scheduleDynamicTranslation();
+            return;
+          }
           if (applyTranslation(el, translations[j])) applied++;
           else if (el.dataset.bilingualDone === 'skip') missing.push(el);
           // 'detached' 的不管，交给补漏轮次
@@ -948,7 +1062,7 @@ async function processBatch(batch, provider, targetLang, myRun, label, canSplit 
       return;
     } catch (err) {
       if (myRun !== runId) return discardBatch(batch);
-      if (attempt < BATCH_RETRY && !pageState.stopped) {
+      if (!serviceFailure && attempt < BATCH_RETRY && !pageState.stopped) {
         const wait = RETRY_DELAY * (attempt + 1);
         console.warn(`[双语翻译] ${label} 请求失败，${wait}ms 后重试: ${err.message}`);
         await new Promise(r => setTimeout(r, wait));
@@ -956,9 +1070,13 @@ async function processBatch(batch, provider, targetLang, myRun, label, canSplit 
       }
       console.error(`[双语翻译] ${label} 最终失败: ${err.message}`);
 
+      if (!serviceFailure && isServiceFailure(err.message)) {
+        serviceFailure = serviceFailureMessage(provider, err.message);
+      }
+
       // 整批失败往往是这批太大（撞上网关超时）。拆成两半再试一次：
       // 串行跑，不额外增加在飞请求数——此刻正处在拥塞/超时的状态里。
-      if (canSplit && live.length >= 2 && !pageState.stopped && myRun === runId) {
+      if (!serviceFailure && canSplit && live.length >= 2 && !pageState.stopped && myRun === runId) {
         const mid = Math.ceil(live.length / 2);
         console.warn(`[双语翻译] ${label} 拆半重试（${mid} + ${live.length - mid} 段）`);
         pageState.done += batch.length - live.length; // 已脱离 DOM 的那些先记账
@@ -967,10 +1085,11 @@ async function processBatch(batch, provider, targetLang, myRun, label, canSplit 
         return;
       }
 
-      live.forEach(el => markError(el, err.message));
+      const message = serviceFailure || err.message;
+      live.forEach(el => markError(el, message));
       pageState.done += batch.length;
       pageState.failed += live.length;
-      pageState.error = err.message;
+      pageState.error = message;
       return;
     }
   }
@@ -986,7 +1105,7 @@ function discardBatch(batch) {
 
 // 撤掉残留的 loading（停止、或某批次异常退出后留下的），让它们能被重新选中
 function clearStaleLoading() {
-  const stale = document.querySelectorAll('[data-bilingual-done="loading"]');
+  const stale = translationNodes('[data-bilingual-done="loading"]');
   stale.forEach(el => {
     el.querySelector('.bilingual-loading')?.remove();
     delete el.dataset.bilingualDone;
@@ -1025,42 +1144,142 @@ async function translateElements(elements, provider, targetLang, myRun, tag) {
   );
 }
 
+// 用户开启本页翻译后持续监听，评论、回复和“加载更多”可在主轮结束很久后出现。
+// DOM 变化合并处理；插件自己的 loading/译文不触发下一轮，也不与主轮争抢并发。
+const DYNAMIC_DELAY = 600;
+const SHADOW_DISCOVERY_INTERVAL = 2000;
+let dynamicEnabled = false;
+let dynamicPending = false;
+let dynamicTimer = null;
+let shadowDiscoveryTimer = null;
+const dynamicObservers = new Map();
+
+function isTranslationMutation(record) {
+  const target = record.target.nodeType === 3 ? record.target.parentElement : record.target;
+  if (target?.closest?.('.bilingual-block, .bilingual-loading, .bilingual-failed, .bilingual-styles')) return true;
+  if (record.type !== 'childList') return false;
+  const changed = [...record.addedNodes, ...record.removedNodes];
+  return changed.length > 0 && changed.every(node => isOwnNode(node));
+}
+
+function observeTranslationRoots() {
+  for (const [root, observer] of dynamicObservers) {
+    if (root.host && !root.host.isConnected) {
+      observer.disconnect();
+      dynamicObservers.delete(root);
+    }
+  }
+  for (const root of translationRoots()) {
+    if (dynamicObservers.has(root)) continue;
+    const observer = new MutationObserver(records => {
+      if (records.some(record => !isTranslationMutation(record))) scheduleDynamicTranslation();
+    });
+    observer.observe(root === document ? document.body : root, {
+      childList: true, subtree: true, characterData: true, attributes: true,
+      attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'aria-expanded', 'open']
+    });
+    dynamicObservers.set(root, observer);
+  }
+}
+
+function scheduleDynamicTranslation() {
+  if (!dynamicEnabled || pageState.stopped || serviceFailure) return;
+  dynamicPending = true;
+  // 不反复重置定时器，避免页面持续刷新时永远等不到“安静”。
+  if (dynamicTimer !== null) return;
+  dynamicTimer = setTimeout(() => {
+    dynamicTimer = null;
+    translateDynamicContent();
+  }, DYNAMIC_DELAY);
+}
+
+function startDynamicTranslation() {
+  dynamicEnabled = true;
+  discoverShadowRoots();
+  observeTranslationRoots();
+  if (shadowDiscoveryTimer !== null) return;
+  // attachShadow 本身没有 DOM mutation；补查已经连接、之后才创建根的评论组件。
+  shadowDiscoveryTimer = setInterval(() => {
+    discoverShadowRoots();
+    const before = dynamicObservers.size;
+    observeTranslationRoots();
+    if (dynamicObservers.size !== before) scheduleDynamicTranslation();
+  }, SHADOW_DISCOVERY_INTERVAL);
+}
+
+function stopDynamicTranslation() {
+  dynamicEnabled = false;
+  dynamicPending = false;
+  if (dynamicTimer !== null) clearTimeout(dynamicTimer);
+  if (shadowDiscoveryTimer !== null) clearInterval(shadowDiscoveryTimer);
+  dynamicTimer = shadowDiscoveryTimer = null;
+  for (const observer of dynamicObservers.values()) observer.disconnect();
+  dynamicObservers.clear();
+}
+
+async function translateDynamicContent() {
+  if (!dynamicEnabled || !dynamicPending || pageState.stopped || serviceFailure || pageState.translating) return;
+  dynamicPending = false;
+  const myRun = runId;
+  let keepAlive;
+  try {
+    repairLostBlocks();
+    const elements = getTranslatableElements();
+    observeTranslationRoots();
+    if (!elements.length) return;
+    pageState.translating = true;
+    pageState.total += elements.length;
+    keepAlive = startKeepAlive();
+    startRepairWatchdog();
+    await translateElements(elements, lastRun.provider, lastRun.targetLang, myRun, '动态内容');
+  } catch (err) {
+    if (myRun === runId) pageState.error = err.message;
+    console.warn(`[双语翻译] 动态内容翻译失败: ${err.message}`);
+  } finally {
+    if (keepAlive) stopKeepAlive(keepAlive);
+    if (myRun === runId) {
+      pageState.translating = false;
+      if (!pageState.stopped) pageState.translated = true;
+      if (serviceFailure) stopDynamicTranslation();
+      else if (dynamicPending) scheduleDynamicTranslation();
+    }
+  }
+}
+
 async function runTranslation(provider, targetLang) {
   if (pageState.translating) return;
+  stopDynamicTranslation();
   lastRun = { provider, targetLang };   // 单段重试按钮沿用这一轮的选择
-
-  // 先等正文稳定，否则拿到的是水合前的旧节点引用（译文会写进被丢弃的节点）
-  const settleT0 = performance.now();
-  await waitForDomSettle();
-  console.log(`[双语翻译] 等待正文稳定 ${((performance.now() - settleT0) / 1000).toFixed(1)}s`);
-
-  const elements = getTranslatableElements();
-  if (!elements.length) {
-    pageState.translated = true;
-    console.log('[双语翻译] 没有找到可翻译的段落');
-    return;
-  }
-
   const myRun = ++runId;
-  const keepAlive = startKeepAlive();   // 必须在任何请求发出前就顶住 SW
-  startRepairWatchdog();     // 从一开始就守，别等某一批的重试结束
+  serviceFailure = null;
+  let keepAlive;
   Object.assign(pageState, {
     translating: true,
     translated: false,
     stopped: false,
-    total: elements.length,
+    total: 0,
     done: 0,
     failed: 0,
     error: null
   });
 
   try {
+    startDynamicTranslation();
+    // 等待期间也标记为进行中，避免重复启动；停止/清除会让等待中的轮次作废。
+    const settleT0 = performance.now();
+    await waitForDomSettle();
+    if (myRun !== runId || pageState.stopped) return;
+    console.log(`[双语翻译] 等待正文稳定 ${((performance.now() - settleT0) / 1000).toFixed(1)}s`);
+    const elements = getTranslatableElements();
+    pageState.total = elements.length;
+    keepAlive = startKeepAlive();
+    startRepairWatchdog();
     await translateElements(elements, provider, targetLang, myRun, '主轮');
 
     // 补漏：翻译期间页面可能重新渲染（React 水合）或懒加载出新段落。
     // 先无成本地把被删掉的译文塞回去，剩下真丢了原文的段落才重新请求翻译。
     for (let round = 1; round <= TOPUP_ROUNDS; round++) {
-      if (pageState.stopped || myRun !== runId) break;
+      if (pageState.stopped || myRun !== runId || serviceFailure) break;
       const repaired = repairLostBlocks();
       if (repaired) console.log(`[双语翻译] 补漏第 ${round} 轮前修复 ${repaired} 处被页面删掉的译文`);
       clearStaleLoading();
@@ -1071,7 +1290,12 @@ async function runTranslation(provider, targetLang) {
     }
   } finally {
     // 只释放自己那一个令牌：并发的单段重试可能还在等，别把它们的心跳一起停掉
-    stopKeepAlive(keepAlive);
+    if (keepAlive) stopKeepAlive(keepAlive);
+    if (myRun === runId) {
+      pageState.translating = false;
+      if (serviceFailure) stopDynamicTranslation();
+      else if (dynamicPending) scheduleDynamicTranslation();
+    }
   }
 
   if (myRun !== runId) return; // 已被新一轮接管，别覆盖它的状态
@@ -1083,31 +1307,32 @@ async function runTranslation(provider, targetLang) {
   // 收尾审计：把"页面上真正看得见几条译文"和"我们以为翻了几段"对上账。
   // 两者不一致就说明译文被框架删掉了，而不是请求失败。
   const tally = {};
-  document.querySelectorAll('[data-bilingual-done]').forEach(el => {
+  translationNodes('[data-bilingual-done]').forEach(el => {
     const k = el.dataset.bilingualDone;
     tally[k] = (tally[k] || 0) + 1;
   });
-  const visible = document.querySelectorAll('.bilingual-block').length;
+  const visible = translationNodes('.bilingual-block').length;
   const states = Object.entries(tally).map(([k, n]) => `${k} ${n}`).join('，') || '无';
   console.log(`[双语翻译] 结束：共 ${pageState.total} 段，失败 ${pageState.failed} 段${pageState.stopped ? '（已停止）' : ''}；页面上译文块 ${visible} 个；段落状态：${states}`);
 }
 
 function toggleVisibility(visible) {
   pageState.visible = visible;
-  document.querySelectorAll('.bilingual-block').forEach(el => {
+  translationNodes('.bilingual-block').forEach(el => {
     el.style.display = visible ? '' : 'none';
   });
 }
 
 function clearAll() {
+  stopDynamicTranslation();
   runId++; // 作废在飞批次，避免旧译文在清除后又插回页面
   stopKeepAlive(true); // 清除是全局动作：连正在重试的单段一起收掉心跳
   if (repairTimer) { clearInterval(repairTimer); repairTimer = null; }
   window.removeEventListener('resize', syncTranslationPlacement);
   for (const { anchor } of trackedPairs) stopSiblingPlacementGuard(anchor);
   trackedPairs.clear(); // 否则守护逻辑会把刚清掉的译文又塞回来
-  document.querySelectorAll('.bilingual-block, .bilingual-loading, .bilingual-failed').forEach(el => el.remove());
-  document.querySelectorAll('[data-bilingual-done]').forEach(el => {
+  translationNodes('.bilingual-block, .bilingual-loading, .bilingual-failed').forEach(el => el.remove());
+  translationNodes('[data-bilingual-done]').forEach(el => {
     delete el.dataset.bilingualDone;
   });
   Object.assign(pageState, { translating: false, translated: false, stopped: false, visible: true, total: 0, done: 0, failed: 0, error: null });
@@ -1122,6 +1347,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case 'stopTranslation':
+      stopDynamicTranslation();
       pageState.stopped = true;
       clearStaleLoading(); // 立刻撤掉未开始批次的占位，在飞批次照常渲染
       // translating 会在在飞批次结束后由 runTranslation 设为 false

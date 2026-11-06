@@ -10,7 +10,7 @@
   line-height: 1.65;
 }
 
-/* 译文文字 —— 继承原文颜色，用透明度做「稍弱于原文」的视觉层级 */
+/* 译文文字 —— JS 从对应原文读取实际颜色，透明度控制视觉层级 */
 .bilingual-text {
   display: block;
   color: inherit;

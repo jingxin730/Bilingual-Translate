@@ -1,6 +1,6 @@
 'use strict';
 
-// MAIN world：只截获 YouTube 自己的字幕请求，沿用播放器的认证和签名。
+// MAIN world：截获原生字幕；下载时也可从当前播放器的可信轨道独立获取字幕。
 (function () {
   const DISCOVERY_INTERVAL_MS = 300;
   const DISCOVERY_ATTEMPTS = 34;
@@ -9,6 +9,23 @@
   let discoveryGeneration = 0;
   let enableGeneration = 0;
   let lastTracksSignature = '';
+  let captionGeneration = 0;
+  let navigating = false;
+  const captionLoads = new Map();
+
+  function hasCaptionText(text) {
+    if (typeof text !== 'string' || !text.trim()) return false;
+    try {
+      if (text.trimStart().startsWith('{')) {
+        return JSON.parse(text).events?.some(event => event.segs?.some(seg => typeof seg.utf8 === 'string' && seg.utf8.trim())) || false;
+      }
+      if (text.trimStart().startsWith('<')) {
+        const doc = new DOMParser().parseFromString(text, 'text/xml');
+        return !doc.querySelector('parsererror') && Array.from(doc.querySelectorAll('p, text')).some(node => node.textContent.trim());
+      }
+    } catch {}
+    return false;
+  }
 
   function currentVideoId() {
     const url = new URL(location.href);
@@ -32,7 +49,7 @@
     const parsed = captionUrl(url);
     const videoId = parsed?.searchParams.get('v') || requestVideoId;
     if (!parsed || !videoId || videoId !== requestVideoId || videoId !== currentVideoId()) return;
-    if (typeof text !== 'string' || text.length < 30) return;
+    if (!hasCaptionText(text)) return;
     const result = { type: 'capturedCaptions', videoId, url: parsed.href, text };
     captured.set(parsed.href, result);
     while (captured.size > 8) captured.delete(captured.keys().next().value);
@@ -178,6 +195,16 @@
     }, 800);
   }
 
+  function findCaptured(videoId, language, requested, anyTrack = false) {
+    return [...captured.values()].reverse().find(item => {
+      if (item.videoId !== videoId) return false;
+      const url = new URL(item.url);
+      if (language && url.searchParams.get('lang') !== language) return false;
+      if (anyTrack) return !url.searchParams.has('tlang');
+      return ['kind', 'name', 'tlang'].every(key => (url.searchParams.get(key) || '') === (requested?.searchParams.get(key) || ''));
+    });
+  }
+
   function replyCaptured(d) {
     const videoId = d.videoId || currentVideoId();
     if (!videoId || videoId !== currentVideoId()) {
@@ -190,32 +217,105 @@
       return;
     }
     const language = d.languageCode || requested?.searchParams.get('lang');
-    const result = [...captured.values()].reverse().find(item => {
-      if (item.videoId !== videoId) return false;
-      const url = new URL(item.url);
-      if (language && url.searchParams.get('lang') !== language) return false;
-      // 同语言的人工、ASR 和已翻译轨道不能互相冒充。
-      return ['kind', 'name', 'tlang'].every(key => (url.searchParams.get(key) || '') === (requested?.searchParams.get(key) || ''));
-    });
+    const result = findCaptured(videoId, language, requested);
     post(result
       ? { type: 'captionsResult', requestId: d.requestId, videoId, ok: true, text: result.text, url: result.url, label: 'captured' }
       : { type: 'captionsResult', requestId: d.requestId, videoId, ok: false, error: 'not-captured' });
   }
 
+  async function loadCaptions(d) {
+    const videoId = d.videoId;
+    const requested = d.baseUrl ? captionUrl(d.baseUrl) : null;
+    const reply = result => post({ type: 'captionsResult', requestId: d.requestId, videoId, ...result });
+    if (navigating || !videoId || videoId !== currentVideoId()) { reply({ ok: false, error: 'stale-video' }); return; }
+    if (d.baseUrl && (!requested || (requested.searchParams.get('v') && requested.searchParams.get('v') !== videoId))) {
+      reply({ ok: false, error: 'invalid-caption-url' }); return;
+    }
+    const language = d.languageCode || requested?.searchParams.get('lang');
+    const selection = requested || (d.kind !== undefined ? new URL('https://www.youtube.com/api/timedtext') : null);
+    if (!requested && selection && d.kind) selection.searchParams.set('kind', d.kind);
+    const key = JSON.stringify([videoId, language, selection?.searchParams.get('kind'), selection?.searchParams.get('name')]);
+    let load = captionLoads.get(key);
+    if (!load) {
+      const generation = captionGeneration;
+      const controller = new AbortController();
+      const isCurrent = () => !navigating && generation === captionGeneration && videoId === currentVideoId() && !controller.signal.aborted;
+      load = { controller };
+      load.promise = (async () => {
+        let enabled = false;
+        const attempted = new Set();
+        let lastError = 'no-caption-data';
+        // 首次下载时字幕模块可能尚未加载；在独立流程内等待元数据/原生字幕。
+        for (let attempt = 0; attempt < 40; attempt++) {
+          if (!isCurrent()) return { ok: false, error: 'stale-video' };
+          const existing = findCaptured(videoId, language, selection, !selection);
+          if (existing) return { ok: true, text: existing.text, url: existing.url, label: 'captured' };
+          const tracks = readTracks(videoId).tracks;
+          const track = tracks.find(item => {
+            if (language && item.languageCode !== language) return false;
+            const url = captionUrl(item.baseUrl);
+            if (!url || url.protocol !== 'https:' || url.searchParams.has('tlang')) return false;
+            if (url.searchParams.get('v') && url.searchParams.get('v') !== videoId) return false;
+            if (url.searchParams.get('lang') && url.searchParams.get('lang') !== item.languageCode) return false;
+            if (selection && ['kind', 'name'].some(param => (url.searchParams.get(param) || '') !== (selection.searchParams.get(param) || ''))) return false;
+            return true;
+          });
+          if (track && originalFetch && attempted.size < 2) {
+            // 只请求播放器当前提供的 URL，绝不直接 fetch 页面消息里的 URL。
+            const url = captionUrl(track.baseUrl);
+            if (!url.searchParams.get('sparams')?.split(',').includes('fmt')) url.searchParams.set('fmt', 'json3');
+            if (!attempted.has(url.href)) {
+              attempted.add(url.href);
+              const timeout = setTimeout(() => controller.abort(), 8000);
+              try {
+                const response = await originalFetch.call(window, url.href, { credentials: 'same-origin', signal: controller.signal });
+                if (!isCurrent()) return { ok: false, error: 'stale-video' };
+                if (!response.ok) return { ok: false, error: `caption-http-${response.status}` };
+                const text = await response.text();
+                if (!isCurrent()) return { ok: false, error: 'stale-video' };
+                if (hasCaptionText(text)) {
+                  notifyCaption(url.href, text, videoId);
+                  return { ok: true, text, url: url.href, label: 'download' };
+                }
+                lastError = 'empty-captions';
+              } catch {
+                if (controller.signal.aborted) return { ok: false, error: generation === captionGeneration ? 'caption-timeout' : 'stale-video' };
+                lastError = 'caption-fetch-failed';
+              } finally { clearTimeout(timeout); }
+            }
+          }
+          if (!enabled) { enableNativeCaptions(language, videoId); enabled = true; }
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+        return { ok: false, error: lastError };
+      })().finally(() => {
+        if (captionLoads.get(key) === load) captionLoads.delete(key);
+      });
+      captionLoads.set(key, load);
+    }
+    try { reply(await load.promise); }
+    catch { reply({ ok: false, error: 'caption-fetch-failed' }); }
+  }
+
   window.addEventListener('yt-navigate-start', () => {
+    navigating = true;
     ++discoveryGeneration;
     ++enableGeneration;
+    ++captionGeneration;
+    for (const load of captionLoads.values()) load.controller.abort();
+    captionLoads.clear();
     clearTimeout(discoveryTimer);
     captured.clear();
   });
-  window.addEventListener('yt-navigate-finish', () => discoverTracks());
+  window.addEventListener('yt-navigate-finish', () => { navigating = false; discoverTracks(); });
   window.addEventListener('message', event => {
     if (event.source !== window || event.data?.source !== 'bilingual-yt-iso') return;
     const d = event.data;
     if (d.type === 'requestTracks') discoverTracks(d.videoId || currentVideoId());
     if (d.type === 'enableCaptions') enableNativeCaptions(d.languageCode, d.videoId || currentVideoId());
-    // 不对页面消息传入的 URL 发网络请求；缓存未命中就立即启用原生字幕兜底。
+    // 观看模式仅查缓存；下载模式独立读取当前播放器轨道并获取完整字幕。
     if (d.type === 'fetchCaptions') replyCaptured(d);
+    if (d.type === 'loadCaptions') loadCaptions(d);
   });
   discoverTracks();
 })();

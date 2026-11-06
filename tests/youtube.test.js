@@ -47,7 +47,7 @@ function element(tag = 'div') {
   return node;
 }
 
-function harness({ translate } = {}) {
+function harness({ translate, providers = { claude: { model: 'fixture-model' } }, bridgeTracks, captionFetch } = {}) {
   let now = 0;
   let timerId = 0;
   const timers = new Map();
@@ -66,6 +66,7 @@ function harness({ translate } = {}) {
   const player = element();
   const video = element('video');
   video.currentTime = 0;
+  video.paused = true;
   const document = {
     body: element('body'), documentElement: element('html'), segments: [],
     createElement(tag) {
@@ -75,7 +76,8 @@ function harness({ translate } = {}) {
     },
     addEventListener() {}, removeEventListener() {},
     querySelector: selector => selector === '#movie_player' ? player : selector === '#movie_player video' || selector === 'video' ? video : null,
-    querySelectorAll: () => document.segments.map(textContent => ({ textContent }))
+    querySelectorAll: () => document.segments.map(textContent => ({ textContent })),
+    getElementById: id => id === 'movie_player' ? player : null
   };
   const window = {
     innerWidth: 1280, innerHeight: 720,
@@ -84,7 +86,10 @@ function harness({ translate } = {}) {
       listeners.get(type).push(callback);
     },
     removeEventListener(type, callback) { listeners.set(type, (listeners.get(type) || []).filter(item => item !== callback)); },
-    postMessage: message => messages.push(JSON.parse(JSON.stringify(message)))
+    postMessage(message) {
+      messages.push(JSON.parse(JSON.stringify(message)));
+      if (bridgeTracks !== undefined) queueMicrotask(() => emit('message', { source: window, data: message }));
+    }
   };
   function emit(type, detail) { for (const listener of listeners.get(type) || []) listener(detail); }
   function send(message) { emit('message', { source: window, data: { source: 'bilingual-yt-bridge', ...message } }); }
@@ -113,7 +118,7 @@ function harness({ translate } = {}) {
       runtime: {
         sendMessage(message, callback) {
           runtimeMessages.push(JSON.parse(JSON.stringify(message)));
-          if (message.action === 'getProviders') return Promise.resolve({ providers: { claude: { model: 'fixture-model' } } });
+          if (message.action === 'getProviders') return Promise.resolve({ providers });
           if (message.action === 'translate') {
             if (translate) translate(message, callback);
             else callback({ translations: message.texts.map(text => `Translated: ${text}`) });
@@ -122,7 +127,22 @@ function harness({ translate } = {}) {
       }
     }
   };
-  vm.runInNewContext(`${code}\nglobalThis.api = { state, activate, deactivate, togglePanel, downloadSubtitles, buildBilingualSrt, buildBilingualMarkdown, formatSrtTime, onCaptionChanged };`, context);
+  if (bridgeTracks !== undefined) {
+    window.fetch = captionFetch || (async () => ({ ok: true, text: async () => captionText }));
+    window.ytInitialPlayerResponse = {
+      videoDetails: { videoId: 'A' },
+      captions: { playerCaptionsTracklistRenderer: { captionTracks: bridgeTracks } }
+    };
+    player.getVideoData = () => ({ video_id: new URL(location.href).searchParams.get('v') });
+    player.getPlayerResponse = () => window.ytInitialPlayerResponse;
+    player.getOption = () => bridgeTracks;
+    class XHR { open() {} send() {} addEventListener() {} }
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'youtube-bridge.js'), 'utf8'), {
+      window, document, location, URL, AbortController, XMLHttpRequest: XHR,
+      setTimeout: context.setTimeout, clearTimeout: context.clearTimeout
+    });
+  }
+  vm.runInNewContext(`${code}\nglobalThis.api = { state, activate, deactivate, togglePanel, downloadSubtitles, buildSubtitleSrt, buildSubtitleMarkdown, formatSrtTime, onCaptionChanged };`, context);
   const { api } = context;
   api.state.buttonEl = element('button');
   api.state.buttonEl.isConnected = true;
@@ -311,7 +331,7 @@ test('download waits for a playback batch and double clicks do not duplicate wor
   assert.equal(h.state.subtitleEl.querySelector('.bilingual-yt-target').textContent, 'Shared: Sentence 1.');
 });
 
-for (const failure of ['API error', 'missing translation', 'timeout']) {
+for (const failure of ['API error', 'timeout']) {
   test(`download refuses incomplete files after ${failure} and retries with successful batches preserved`, async () => {
     let requests = 0;
     let retry = false;
@@ -319,7 +339,6 @@ for (const failure of ['API error', 'missing translation', 'timeout']) {
       requests++;
       if (requests !== 2 || retry) callback({ translations: message.texts.map(text => `Saved: ${text}`) });
       else if (failure === 'API error') callback({ error: 'fixture failure' });
-      else if (failure === 'missing translation') callback({ translations: [''] });
     } });
     capture(h, fullCaptionText(25));
     const download = h.downloadSubtitles();
@@ -409,16 +428,12 @@ test('DOM download records repeated lines and seek timing, reuses translations, 
   assert.equal(h.state.downloadMessage, 'ytDownloadPartialComplete');
 });
 
-test('download enables native captions and waits for captured data without enabling translation', async () => {
+test('download requests complete captions independently without enabling playback translation', async () => {
   const h = harness();
   h.send({ type: 'tracks', videoId: 'A', tracks: [track], status: 'ready' });
   const download = h.downloadSubtitles();
-  const request = h.messages.find(message => message.type === 'fetchCaptions');
-  h.send({ type: 'captionsResult', requestId: request.requestId, ok: false, error: 'not-captured' });
-  await settle();
-  assert.equal(h.messages.at(-1).type, 'enableCaptions');
-  capture(h, fullCaptionText(1));
-  h.tick(250);
+  const request = h.messages.find(message => message.type === 'loadCaptions');
+  h.send({ type: 'captionsResult', requestId: request.requestId, ok: true, text: fullCaptionText(1), url: track.baseUrl });
   await download;
   assert.equal(h.downloads.length, 1);
   assert.equal(h.state.active, false);
@@ -429,7 +444,8 @@ test('no full or recorded captions reports a recoverable error without downloadi
   const h = harness();
   h.send({ type: 'tracks', videoId: 'A', tracks: [], status: 'unavailable', nativeAvailable: true });
   const download = h.downloadSubtitles();
-  for (let i = 0; i < 40; i++) { h.tick(250); await settle(); }
+  const request = h.messages.find(message => message.type === 'loadCaptions');
+  h.send({ type: 'captionsResult', requestId: request.requestId, ok: false, error: 'no-caption-data' });
   await download;
   assert.equal(h.downloads.length, 0);
   assert.equal(h.state.downloadMessage, 'ytDownloadFailed ytDownloadNoData');
@@ -439,7 +455,7 @@ test('SRT timestamps carry milliseconds and subtitle lines cannot create empty c
   const h = harness();
   assert.equal(h.formatSrtTime(3599.9996), '01:00:00,000');
   assert.equal(h.formatSrtTime(3661.005), '01:01:01,005');
-  const text = h.buildBilingualSrt([{ start: 1, end: 1, text: 'A\r\n\r\nB' }], ['甲\n\n乙']);
+  const text = h.buildSubtitleSrt([{ start: 1, end: 1, text: 'A\r\n\r\nB' }], ['甲\n\n乙']);
   assert.equal(text, '1\n00:00:01,000 --> 00:00:01,001\nA\nB\n甲\n乙\n');
 });
 
@@ -561,7 +577,7 @@ test('Markdown partial downloads label their scope in the panel, filename, and d
 test('Markdown preserves subtitle text containing formatting characters and HTML as literal text', () => {
   const h = harness();
   h.document.title = 'Title [one] <two>';
-  const text = h.buildBilingualMarkdown(
+  const text = h.buildSubtitleMarkdown(
     [{ start: 61.25, end: 62, text: '# title\r\n[link](https://example.com) & <b>bold</b>\n*word*' }],
     ['译文 **加粗**\n`code`'], { videoId: 'A', targetLang: 'zh' }, false
   );
@@ -591,4 +607,466 @@ test('the format selector stays disabled through preparation and restores after 
   await download;
   assert.equal(select.disabled, false);
   assert.match(h.downloads[0].filename, /\.md$/);
+});
+
+test('download automatically repairs only missing items and keeps translations in their original order', async () => {
+  let calls = 0;
+  const h = harness({ translate(message, callback) {
+    calls++;
+    callback({ translations: message.texts.map(text => {
+      if (calls === 1 && ['Sentence 2.', 'Sentence 7.', 'Sentence 19.'].includes(text)) return '';
+      if (calls === 2 && text === 'Sentence 19.') return '';
+      return `${calls === 1 ? 'Original' : 'Recovered'}: ${text}`;
+    }) });
+  } });
+  capture(h, fullCaptionText(25));
+  h.state.downloadFormat = 'md';
+  await h.downloadSubtitles();
+  assert.deepEqual(translateMessages(h).map(message => message.texts.length), [20, 3, 1, 5]);
+  assert.deepEqual(translateMessages(h)[1].texts, ['Sentence 2.', 'Sentence 7.', 'Sentence 19.']);
+  assert.deepEqual(translateMessages(h)[2].texts, ['Sentence 19.']);
+  assert.equal(h.downloads.length, 1);
+  const text = await h.downloads[0].blob.text();
+  assert.ok(text.includes('Sentence 1\\.\n\nOriginal: Sentence 1\\.'));
+  assert.ok(text.includes('Sentence 2\\.\n\nRecovered: Sentence 2\\.'));
+  assert.ok(text.includes('Sentence 19\\.\n\nRecovered: Sentence 19\\.'));
+  h.activate();
+  await settle();
+  assert.equal(h.state.subtitleEl.querySelector('.bilingual-yt-target').textContent, 'Original: Sentence 1.');
+  h.video.currentTime = 2;
+  h.state.onTimeUpdate();
+  assert.equal(h.state.subtitleEl.querySelector('.bilingual-yt-target').textContent, 'Recovered: Sentence 2.');
+  assert.equal(translateMessages(h).length, 4);
+});
+
+test('recovery shrinks larger gaps to groups of five and then individual subtitles', async () => {
+  let calls = 0;
+  const h = harness({ translate(message, callback) {
+    calls++;
+    callback({ translations: message.texts.map(text => calls === 1 || message.texts.length > 1 ? '' : `Recovered: ${text}`) });
+  } });
+  capture(h, fullCaptionText(6));
+  await h.downloadSubtitles();
+  assert.deepEqual(translateMessages(h).map(message => message.texts.length), [6, 5, 1, 1, 1, 1, 1, 1]);
+  assert.equal(h.downloads.length, 1);
+  assert.equal(h.state.downloadMessage, 'ytDownloadComplete');
+});
+
+test('persistent missing output stops after two recovery rounds and the next download retains partial successes', async () => {
+  let retry = false;
+  const h = harness({ translate(message, callback) {
+    callback({ translations: message.texts.map(text => text === 'Sentence 2.' && !retry ? '' : `Stable: ${text}`) });
+  } });
+  capture(h, fullCaptionText(3));
+  await h.downloadSubtitles();
+  assert.equal(h.downloads.length, 0);
+  assert.deepEqual(translateMessages(h).map(message => message.texts.length), [3, 1, 1]);
+  assert.match(h.state.downloadMessage, /ytTranslationIncomplete/);
+  assert.deepEqual(Array.from(h.state.cache.get('A').translations.get(0)), ['Stable: Sentence 1.', '', 'Stable: Sentence 3.']);
+  retry = true;
+  await h.downloadSubtitles();
+  assert.deepEqual(translateMessages(h).at(-1).texts, ['Sentence 2.']);
+  assert.equal(translateMessages(h).length, 4);
+  assert.equal(h.downloads.length, 1);
+});
+
+for (const interruption of ['video', 'provider', 'language']) {
+  test(`a ${interruption} change during missing-item recovery stops requests and cache writes`, async () => {
+    const pending = [];
+    const h = harness({ translate: (message, callback) => pending.push({ message, callback }) });
+    capture(h, fullCaptionText(3));
+    const download = h.downloadSubtitles();
+    await settle();
+    pending[0].callback({ translations: ['Saved first', '', 'Saved third'] });
+    await settle();
+    assert.equal(pending.length, 2);
+    assert.deepEqual(Array.from(pending[1].message.texts), ['Sentence 2.']);
+    assert.match(h.state.downloadMessage, /ytDownloadRepairing/);
+    if (interruption === 'video') {
+      h.emit('yt-navigate-start');
+      h.location.href = 'https://www.youtube.com/watch?v=B';
+      h.emit('yt-navigate-finish');
+    } else h.changeStorage({ [interruption === 'provider' ? 'provider' : 'targetLang']: { newValue: interruption === 'provider' ? 'deepseek' : 'ja' } });
+    pending[1].callback({ translations: [''] });
+    await download;
+    assert.equal(pending.length, 2);
+    assert.equal(h.downloads.length, 0);
+    if (interruption !== 'video') assert.equal(h.state.cache.get('A').translations.size, 0);
+  });
+}
+
+test('DOM fallback also repairs missing translations while preserving successful cached text', async () => {
+  const h = harness({ translate(message, callback) {
+    callback({ translations: message.texts.map(text => text === 'Missing.' && message.texts.length > 1 ? '' : `Saved: ${text}`) });
+  } });
+  h.send({ type: 'tracks', videoId: 'A', tracks: [], status: 'unavailable', nativeAvailable: true });
+  h.activate();
+  h.document.segments = ['First.'];
+  h.onCaptionChanged();
+  h.video.currentTime = 1;
+  h.document.segments = ['Missing.'];
+  h.onCaptionChanged();
+  h.video.currentTime = 2;
+  h.document.segments = ['Third.'];
+  h.onCaptionChanged();
+  await h.downloadSubtitles();
+  assert.deepEqual(translateMessages(h).map(message => message.texts.length), [3, 1]);
+  assert.deepEqual(translateMessages(h)[1].texts, ['Missing.']);
+  assert.equal(h.downloads.length, 1);
+  assert.match(await h.downloads[0].blob.text(), /Missing\.\nSaved: Missing\./);
+});
+
+test('playback and download share missing-item recovery and show successful translations while waiting', async () => {
+  const pending = [];
+  const h = harness({ translate: (message, callback) => pending.push({ message, callback }) });
+  capture(h, fullCaptionText(3));
+  h.activate();
+  const download = h.downloadSubtitles();
+  await settle();
+  assert.equal(pending.length, 1);
+  pending[0].callback({ translations: ['Stable first', '', 'Stable third'] });
+  await settle();
+  assert.equal(pending.length, 2);
+  assert.equal(h.state.subtitleEl.querySelector('.bilingual-yt-target').textContent, 'Stable first');
+  h.video.currentTime = 2;
+  h.state.onTimeUpdate();
+  assert.equal(pending.length, 2);
+  assert.equal(h.state.subtitleEl.querySelector('.bilingual-yt-target').textContent, 'ytTranslating');
+  pending[1].callback({ translations: ['Recovered second'] });
+  await download;
+  assert.equal(pending.length, 2);
+  assert.equal(h.downloads.length, 1);
+  assert.equal(h.state.subtitleEl.querySelector('.bilingual-yt-target').textContent, 'Recovered second');
+});
+
+test('failed playback batches observe the retry cooldown instead of restarting recovery on every time update', async () => {
+  const h = harness({ translate: (message, callback) => callback({ translations: message.texts.map(() => '') }) });
+  capture(h, fullCaptionText(1));
+  h.activate();
+  await settle();
+  assert.equal(translateMessages(h).length, 3);
+  for (let i = 0; i < 20; i++) h.state.onTimeUpdate();
+  await settle();
+  assert.equal(translateMessages(h).length, 3);
+  h.tick(5000);
+  h.state.onTimeUpdate();
+  await settle();
+  assert.equal(translateMessages(h).length, 6);
+});
+
+test('DeepSeek response parsing and subtitle download recover together across the background message boundary', async () => {
+  let calls = 0;
+  const backgroundContext = {
+    importScripts() {}, API_TOKEN: 'fixture-token', TextDecoder, AbortController, setTimeout, clearTimeout,
+    PROVIDERS: { deepseek: { url: 'https://fixture.invalid', model: 'deepseek-flash', type: 'openai' } },
+    console: { log() {} }, chrome: { runtime: { onMessage: { addListener() {} } }, commands: { onCommand: { addListener() {} } } },
+    async fetch(url, options) {
+      calls++;
+      const texts = JSON.parse(options.body).messages[0].content.split('\n\n')[1].split('\n').map(text => text.replace(/^\d+\. /, ''));
+      const raw = texts.map((text, i) => calls === 1 && i === 1 ? '' : `（${i + 1}）译文: ${text}`).filter(Boolean).join('\n');
+      const data = `data: ${JSON.stringify({ choices: [{ delta: { content: raw }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n`;
+      let read = false;
+      return { ok: true, body: { getReader: () => ({ async read() {
+        if (read) return { done: true };
+        read = true;
+        return { done: false, value: new TextEncoder().encode(data) };
+      } }) } };
+    }
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'background.js'), 'utf8'), backgroundContext);
+  const h = harness({ translate(message, callback) {
+    backgroundContext.translate(message.texts, message.provider, message.targetLang)
+      .then(translations => callback({ translations })).catch(error => callback({ error: error.message }));
+  } });
+  h.state.provider = 'deepseek';
+  h.state.downloadFormat = 'md';
+  capture(h, fullCaptionText(3));
+  await h.downloadSubtitles();
+  assert.equal(calls, 2);
+  assert.deepEqual(translateMessages(h)[1].texts, ['Sentence 2.']);
+  assert.equal(h.downloads.length, 1);
+  const text = await h.downloads[0].blob.text();
+  for (let i = 1; i <= 3; i++) assert.ok(text.includes(`Sentence ${i}\\.\n\n译文: Sentence ${i}\\.`));
+});
+
+for (const format of ['srt', 'md']) {
+  test(`original-only ${format} exports the source language without requesting or requiring translations`, async () => {
+    const h = harness({ translate() { assert.fail('Original export must not invoke translation'); } });
+    const text = JSON.stringify({ events: [
+      { tStartMs: 0, dDurationMs: 1800, segs: [{ utf8: 'Hola mundo.' }] },
+      { tStartMs: 2000, dDurationMs: 1800, segs: [{ utf8: '¿Cómo estás?' }] }
+    ] });
+    h.send({ type: 'capturedCaptions', videoId: 'A', url: 'https://www.youtube.com/api/timedtext?v=A&lang=es', text });
+    h.state.downloadContent = 'original';
+    h.state.downloadFormat = format;
+    await h.downloadSubtitles();
+    assert.equal(h.downloads.length, 1);
+    assert.match(h.downloads[0].filename, new RegExp(`\\.A\\.es\\.original\\.${format}$`));
+    assert.equal(translateMessages(h).length, 0);
+    assert.equal(h.state.cache.get('A').translations.size, 0);
+    assert.equal(h.state.active, false);
+    const result = await h.downloads[0].blob.text();
+    assert.equal(result.includes('Translated:'), false);
+    assert.equal(result.includes('undefined'), false);
+    assert.equal(result.includes('null'), false);
+    if (format === 'srt') {
+      assert.equal(result, '1\n00:00:00,000 --> 00:00:02,000\nHola mundo.\n\n2\n00:00:02,000 --> 00:00:04,100\n¿Cómo estás?\n');
+      assert.equal(h.downloads[0].blob.type, 'application/x-subrip;charset=utf-8');
+    } else {
+      assert.ok(result.includes('[ytDownloadVideoLink](https://www.youtube.com/watch?v=A)'));
+      assert.ok(result.includes('Hola mundo\\.\n\n---\n'));
+      assert.ok(result.includes('¿Cómo estás?\n'));
+      assert.equal(h.downloads[0].blob.type, 'text/markdown;charset=utf-8');
+    }
+    assert.equal(h.state.downloadMessage, 'ytDownloadOriginalComplete');
+  });
+}
+
+test('download controls are grouped, reflect original-only choice, and retain it when reopening the panel', async () => {
+  const h = harness();
+  capture(h, fullCaptionText(2));
+  await h.togglePanel();
+  const panel = h.state.panelEl;
+  const playback = panel.querySelector('.bilingual-yt-playback-section');
+  const downloads = panel.querySelector('.bilingual-yt-download-section');
+  assert.equal(playback.querySelector('.bilingual-yt-provider-select').value, 'claude');
+  assert.ok(playback.querySelector('.bilingual-yt-playback-btn'));
+  assert.equal(playback.querySelector('.bilingual-yt-download-btn'), null);
+  const contentSelect = downloads.querySelector('.bilingual-yt-download-content');
+  assert.deepEqual(contentSelect.children.map(option => option.value), ['original', 'bilingual']);
+  assert.equal(contentSelect.value, 'bilingual');
+  contentSelect.value = 'original';
+  contentSelect.listeners.get('change')();
+  const formatSelect = downloads.querySelector('.bilingual-yt-download-format');
+  formatSelect.value = 'md';
+  formatSelect.listeners.get('change')();
+  const button = downloads.querySelector('.bilingual-yt-download-btn');
+  assert.equal(button.textContent, 'ytDownloadOriginal (MD)');
+  assert.equal(downloads.querySelector('.bilingual-yt-download-hint').textContent, 'ytDownloadOriginalHint');
+  await button.listeners.get('click')();
+  assert.equal(translateMessages(h).length, 0);
+  await h.togglePanel();
+  await h.togglePanel();
+  assert.equal(h.state.panelEl.querySelector('.bilingual-yt-download-content').value, 'original');
+  assert.equal(h.state.panelEl.querySelector('.bilingual-yt-download-format').value, 'md');
+});
+
+test('original download remains available when no translation model is configured', async () => {
+  const h = harness({ providers: {} });
+  capture(h, fullCaptionText(1));
+  await h.togglePanel();
+  assert.equal(h.state.downloadContent, 'original');
+  const panel = h.state.panelEl;
+  assert.equal(panel.querySelector('.bilingual-yt-provider-select').disabled, true);
+  assert.equal(panel.querySelector('.bilingual-yt-playback-btn').disabled, true);
+  assert.equal(panel.querySelector('.bilingual-yt-download-btn').disabled, false);
+  const contentSelect = panel.querySelector('.bilingual-yt-download-content');
+  assert.equal(contentSelect.children.find(option => option.value === 'bilingual').disabled, true);
+  await panel.querySelector('.bilingual-yt-download-btn').listeners.get('click')();
+  assert.equal(h.downloads.length, 1);
+  assert.equal(translateMessages(h).length, 0);
+});
+
+test('original download does not wait for a pending live translation and bilingual download still shares its cache', async () => {
+  let reply;
+  const h = harness({ translate: (message, callback) => { reply = callback; } });
+  capture(h, fullCaptionText(1));
+  h.activate();
+  h.state.downloadContent = 'original';
+  await h.downloadSubtitles();
+  assert.equal(h.downloads.length, 1);
+  assert.equal(translateMessages(h).length, 1);
+  assert.match(h.downloads[0].filename, /original\.srt$/);
+  h.state.downloadContent = 'bilingual';
+  const bilingualDownload = h.downloadSubtitles();
+  await settle();
+  assert.equal(h.downloads.length, 1);
+  assert.equal(translateMessages(h).length, 1);
+  reply({ translations: ['Shared translation'] });
+  await bilingualDownload;
+  assert.equal(h.downloads.length, 2);
+  assert.match(h.downloads[1].filename, /bilingual\.srt$/);
+  assert.match(await h.downloads[1].blob.text(), /Sentence 1\.\nShared translation/);
+});
+
+test('original DOM downloads retain the watched-only warning and contain no translated text', async () => {
+  const h = harness();
+  h.send({ type: 'tracks', videoId: 'A', tracks: [], status: 'unavailable', nativeAvailable: true });
+  h.document.segments = ['Recorded original.'];
+  h.activate();
+  h.tick(2100);
+  await settle();
+  const previousRequests = translateMessages(h).length;
+  h.state.downloadContent = 'original';
+  h.state.downloadFormat = 'md';
+  await h.togglePanel();
+  const button = h.state.panelEl.querySelector('.bilingual-yt-download-btn');
+  assert.equal(button.textContent, 'ytDownloadWatchedOriginal (MD)');
+  assert.equal(h.state.panelEl.querySelector('.bilingual-yt-download-hint').textContent, 'ytDownloadOriginalHint ytDownloadPartialHint');
+  await button.listeners.get('click')();
+  assert.equal(translateMessages(h).length, previousRequests);
+  assert.match(h.downloads[0].filename, /\.watched\.original\.md$/);
+  const text = await h.downloads[0].blob.text();
+  assert.ok(text.includes('> ytDownloadPartialHint'));
+  assert.ok(text.includes('Recorded original\\.'));
+  assert.equal(text.includes('Translated:'), false);
+});
+
+test('content and format are frozen while acquiring original captions, and translation settings cannot cancel it', async () => {
+  const h = harness();
+  h.send({ type: 'tracks', videoId: 'A', tracks: [track], status: 'ready' });
+  await h.togglePanel();
+  const panel = h.state.panelEl;
+  const contentSelect = panel.querySelector('.bilingual-yt-download-content');
+  contentSelect.value = 'original';
+  contentSelect.listeners.get('change')();
+  const download = h.downloadSubtitles();
+  assert.equal(contentSelect.disabled, true);
+  assert.equal(panel.querySelector('.bilingual-yt-download-format').disabled, true);
+  const request = h.messages.find(message => message.type === 'loadCaptions');
+  h.changeStorage({ targetLang: { newValue: 'ja' }, provider: { newValue: 'deepseek' } });
+  assert.ok(h.state.downloadJob);
+  h.send({ type: 'captionsResult', requestId: request.requestId, ok: true, text: fullCaptionText(1) });
+  await download;
+  assert.equal(h.downloads.length, 1);
+  assert.equal(translateMessages(h).length, 0);
+  assert.match(h.downloads[0].filename, /\.en\.original\.srt$/);
+  assert.equal(contentSelect.disabled, false);
+});
+
+test('navigation cancels an original caption download before it can save the previous video', async () => {
+  const h = harness();
+  h.send({ type: 'tracks', videoId: 'A', tracks: [track], status: 'ready' });
+  h.state.downloadContent = 'original';
+  const download = h.downloadSubtitles();
+  const request = h.messages.find(message => message.type === 'loadCaptions');
+  h.emit('yt-navigate-start');
+  h.location.href = 'https://www.youtube.com/watch?v=B';
+  h.emit('yt-navigate-finish');
+  h.send({ type: 'captionsResult', requestId: request.requestId, ok: true, text: fullCaptionText(1) });
+  await download;
+  assert.equal(h.downloads.length, 0);
+  assert.equal(translateMessages(h).length, 0);
+});
+
+for (const content of ['original', 'bilingual']) {
+  for (const format of ['srt', 'md']) {
+    test(`cold paused-page ${content} ${format} download works through the real bridge without starting playback subtitles`, async () => {
+      let fetchCalls = 0;
+      const h = harness({
+        bridgeTracks: [track],
+        captionFetch: async () => {
+          fetchCalls++;
+          return { ok: true, text: async () => fullCaptionText(25) };
+        }
+      });
+      await settle();
+      assert.equal(h.state.cache.size, 0);
+      assert.equal(h.state.active, false);
+      assert.equal(h.video.paused, true);
+      h.state.downloadContent = content;
+      h.state.downloadFormat = format;
+      await h.downloadSubtitles();
+      assert.equal(fetchCalls, 1);
+      assert.equal(h.downloads.length, 1);
+      assert.equal(h.state.active, false);
+      assert.equal(h.state.mode, null);
+      assert.equal(h.state.subtitleEl, null);
+      assert.equal(h.state.captionObserver, null);
+      assert.equal(h.video.currentTime, 0);
+      assert.equal(h.video.paused, true);
+      assert.equal(translateMessages(h).length, content === 'original' ? 0 : 2);
+      assert.match(h.downloads[0].filename, new RegExp(`${content}\\.${format}$`));
+      const text = await h.downloads[0].blob.text();
+      assert.ok(text.includes(format === 'md' ? 'Sentence 25\\.' : 'Sentence 25.'));
+      assert.equal(text.includes('Translated:'), content === 'bilingual');
+      const requests = translateMessages(h).length;
+      await h.downloadSubtitles();
+      assert.equal(h.downloads.length, 2);
+      assert.equal(fetchCalls, 1);
+      assert.equal(translateMessages(h).length, requests);
+    });
+  }
+}
+
+test('a native-only page with no track URL can receive full captions during download without watching translation', async () => {
+  const h = harness();
+  h.send({ type: 'tracks', videoId: 'A', tracks: [], status: 'unavailable', nativeAvailable: true });
+  h.state.downloadContent = 'original';
+  const download = h.downloadSubtitles();
+  const request = h.messages.find(message => message.type === 'loadCaptions');
+  assert.ok(request);
+  assert.equal(request.baseUrl, undefined);
+  h.send({ type: 'captionsResult', requestId: request.requestId, ok: true, text: fullCaptionText(1), url: track.baseUrl });
+  await download;
+  assert.equal(h.downloads.length, 1);
+  assert.equal(translateMessages(h).length, 0);
+  assert.equal(h.state.pickedTrack.languageCode, 'en');
+  assert.equal(h.state.active, false);
+  assert.equal(h.video.paused, true);
+});
+
+for (const content of ['original', 'bilingual']) {
+  test(`DOM fallback ${content} download independently records native captions without ever activating playback translation`, async () => {
+    const h = harness();
+    h.send({ type: 'tracks', videoId: 'A', tracks: [], status: 'unavailable', nativeAvailable: true });
+    h.state.downloadContent = content;
+    h.state.downloadFormat = 'md';
+    const download = h.downloadSubtitles();
+    const request = h.messages.find(message => message.type === 'loadCaptions');
+    h.document.segments = ['First native line.'];
+    h.tick(250);
+    h.video.currentTime = 1;
+    h.document.segments = ['Second native line.'];
+    h.tick(250);
+    h.video.currentTime = 2;
+    h.tick(250);
+    assert.equal(translateMessages(h).length, 0);
+    h.send({ type: 'captionsResult', requestId: request.requestId, ok: false, error: 'empty-captions' });
+    await download;
+    assert.equal(h.downloads.length, 1);
+    assert.equal(h.state.active, false);
+    assert.equal(h.state.mode, null);
+    assert.equal(h.state.captionObserver, null);
+    assert.equal(h.state.subtitleEl, null);
+    assert.match(h.downloads[0].filename, new RegExp(`watched\\.${content}\\.md$`));
+    const text = await h.downloads[0].blob.text();
+    assert.ok(text.includes('> ytDownloadPartialHint'));
+    assert.ok(text.includes('First native line\\.'));
+    assert.ok(text.includes('Second native line\\.'));
+    assert.equal(translateMessages(h).length, content === 'original' ? 0 : 1);
+    const count = h.state.cache.get('A').cues.length;
+    h.document.segments = ['Later line must not be captured after completion.'];
+    h.tick(1000);
+    assert.equal(h.state.cache.get('A').cues.length, count);
+  });
+}
+
+test('an explicit caption rate limit is reported instead of suggesting that playback translation must be started', async () => {
+  const h = harness({ bridgeTracks: [track], captionFetch: async () => ({ ok: false, status: 429 }) });
+  await settle();
+  h.state.downloadContent = 'original';
+  await h.downloadSubtitles();
+  assert.equal(h.downloads.length, 0);
+  assert.match(h.state.downloadMessage, /ytDownloadFetchFailed \(HTTP 429\)/);
+  assert.equal(h.state.active, false);
+  assert.equal(translateMessages(h).length, 0);
+});
+
+test('download acquisition timeout ends cleanly and cannot save an old late response', async () => {
+  const h = harness();
+  h.send({ type: 'tracks', videoId: 'A', tracks: [track], status: 'ready' });
+  h.state.downloadContent = 'original';
+  const download = h.downloadSubtitles();
+  const request = h.messages.find(message => message.type === 'loadCaptions');
+  h.tick(28000);
+  await download;
+  assert.equal(h.state.downloadJob, null);
+  assert.equal(h.state.downloadMessage, 'ytDownloadFailed ytDownloadCaptionTimeout');
+  h.send({ type: 'captionsResult', requestId: request.requestId, ok: true, text: captionText, url: track.baseUrl });
+  await settle();
+  assert.equal(h.downloads.length, 0);
+  h.document.segments = ['No observer should still record this.'];
+  h.tick(1000);
+  assert.equal(h.state.cache.size, 0);
 });

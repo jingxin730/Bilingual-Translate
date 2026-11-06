@@ -22,6 +22,7 @@ function harness(options = {}) {
     options: options.tracks || [],
     cc: options.cc || null,
     fetchCalls: 0,
+    fetchRequests: [],
     selected: [],
     loaded: 0
   };
@@ -47,7 +48,8 @@ function harness(options = {}) {
     postMessage: message => messages.push(JSON.parse(JSON.stringify(message))),
     fetch: (...args) => {
       data.fetchCalls++;
-      return options.fetch ? options.fetch(...args) : Promise.resolve({ ok: true, clone: () => ({ text: () => Promise.resolve(captionText) }) });
+      data.fetchRequests.push(args);
+      return options.fetch ? options.fetch(...args) : Promise.resolve({ ok: true, text: () => Promise.resolve(captionText), clone: () => ({ text: () => Promise.resolve(captionText) }) });
     }
   };
   function emit(type, detail) {
@@ -68,7 +70,7 @@ function harness(options = {}) {
     now = end;
   }
   vm.runInNewContext(code, {
-    window, location, URL, XMLHttpRequest: XHR,
+    window, location, URL, AbortController, XMLHttpRequest: XHR,
     document: { getElementById: () => player },
     setTimeout: (callback, ms) => {
       timers.set(++timerId, { callback, at: now + ms });
@@ -206,4 +208,145 @@ test('retries a delayed caption module and selects the requested native language
   assert.equal(h.data.selected.length, 1);
   assert.equal(h.data.selected[0].languageCode, 'fr');
   assert.equal(h.messages.at(-1).status, 'ready');
+});
+
+const settle = () => new Promise(setImmediate);
+const resultFor = (h, requestId) => h.messages.find(message => message.type === 'captionsResult' && message.requestId === requestId);
+
+test('cold download fetches the current player track without waiting for playback or a native CC request', async () => {
+  const h = harness({ initial: response('A', [track()]) });
+  h.send({ type: 'loadCaptions', videoId: 'A', requestId: 11, languageCode: 'en', baseUrl: track().baseUrl });
+  await settle();
+  assert.equal(resultFor(h, 11).ok, true);
+  assert.equal(resultFor(h, 11).text, captionText);
+  assert.equal(resultFor(h, 11).label, 'download');
+  assert.equal(h.data.fetchCalls, 1);
+  assert.equal(new URL(h.data.fetchRequests[0][0]).searchParams.get('fmt'), 'json3');
+  assert.equal(h.data.fetchRequests[0][1].credentials, 'same-origin');
+  assert.equal(h.data.loaded, 0);
+  assert.equal(h.data.selected.length, 0);
+});
+
+test('download resolves fresh signed URLs from current metadata instead of fetching the URL in a page message', async () => {
+  const fresh = { ...track(), baseUrl: `${track().baseUrl}&signature=fresh` };
+  const h = harness({ initial: response('A', [fresh]) });
+  h.send({ type: 'loadCaptions', videoId: 'A', requestId: 12, languageCode: 'en', baseUrl: `${track().baseUrl}&signature=old` });
+  await settle();
+  assert.equal(resultFor(h, 12).ok, true);
+  assert.equal(new URL(h.data.fetchRequests[0][0]).searchParams.get('signature'), 'fresh');
+});
+
+test('download loads a missing caption module and waits for delayed track metadata by itself', async () => {
+  const h = harness();
+  h.send({ type: 'loadCaptions', videoId: 'A', requestId: 13, languageCode: 'en' });
+  assert.equal(h.data.loaded, 1);
+  assert.equal(h.data.fetchCalls, 0);
+  h.data.response = response('A', [track()]);
+  h.tick(250);
+  await settle();
+  assert.equal(resultFor(h, 13).ok, true);
+  assert.equal(h.data.fetchCalls, 1);
+});
+
+test('concurrent download acquisitions share one request and future acquisitions reuse captured captions', async () => {
+  let finish;
+  const h = harness({ initial: response('A', [track()]), fetch: () => new Promise(resolve => { finish = resolve; }) });
+  for (const requestId of [14, 15]) h.send({ type: 'loadCaptions', videoId: 'A', requestId, languageCode: 'en', baseUrl: track().baseUrl });
+  assert.equal(h.data.fetchCalls, 1);
+  finish({ ok: true, text: async () => captionText });
+  await settle();
+  assert.equal(resultFor(h, 14).ok, true);
+  assert.equal(resultFor(h, 15).ok, true);
+  h.send({ type: 'loadCaptions', videoId: 'A', requestId: 16, languageCode: 'en', baseUrl: track().baseUrl });
+  await settle();
+  assert.equal(resultFor(h, 16).label, 'captured');
+  assert.equal(h.data.fetchCalls, 1);
+});
+
+test('native capture after an empty direct response completes download without enabling playback translation', async () => {
+  const h = harness({ initial: response('A', [track()]), fetch: async () => ({ ok: true, text: async () => '' }) });
+  h.send({ type: 'loadCaptions', videoId: 'A', requestId: 17, languageCode: 'en', baseUrl: track().baseUrl });
+  await settle();
+  assert.equal(h.data.loaded, 1);
+  const xhr = new h.XHR();
+  xhr.open('GET', track().baseUrl);
+  xhr.send();
+  xhr.status = 200;
+  xhr.responseText = captionText;
+  xhr.listener();
+  h.tick(250);
+  await settle();
+  assert.equal(resultFor(h, 17).ok, true);
+  assert.equal(resultFor(h, 17).label, 'captured');
+  assert.equal(h.data.fetchCalls, 1);
+});
+
+test('download refuses external, stale and translated metadata tracks and rejects supplied external URLs', async () => {
+  for (const baseUrl of ['https://example.com/api/timedtext?v=A&lang=en', `${track().baseUrl}&tlang=zh`, 'https://www.youtube.com/api/timedtext?v=B&lang=en']) {
+    const h = harness({ initial: response('A', [{ ...track(), baseUrl }]) });
+    h.send({ type: 'loadCaptions', videoId: 'A', requestId: 18, languageCode: 'en' });
+    for (let i = 0; i < 40; i++) { h.tick(250); await settle(); }
+    assert.equal(resultFor(h, 18).ok, false);
+    assert.equal(h.data.fetchCalls, 0);
+  }
+  const h = harness({ initial: response('A', [track()]) });
+  h.send({ type: 'loadCaptions', videoId: 'A', requestId: 19, baseUrl: 'https://example.com/api/timedtext?v=A&lang=en' });
+  await settle();
+  assert.equal(resultFor(h, 19).error, 'invalid-caption-url');
+  assert.equal(h.data.fetchCalls, 0);
+});
+
+test('rate-limited caption requests stop once and report the HTTP error rather than requiring playback', async () => {
+  const h = harness({ initial: response('A', [track()]), fetch: async () => ({ ok: false, status: 429 }) });
+  h.send({ type: 'loadCaptions', videoId: 'A', requestId: 20, languageCode: 'en' });
+  await settle();
+  h.tick(10000);
+  assert.equal(resultFor(h, 20).error, 'caption-http-429');
+  assert.equal(h.data.fetchCalls, 1);
+});
+
+test('navigation aborts in-flight caption downloads and ignores late old-video results', async () => {
+  let finish;
+  let signal;
+  const h = harness({ initial: response('A', [track()]), fetch: (url, options) => {
+    signal = options.signal;
+    return new Promise(resolve => { finish = resolve; });
+  } });
+  h.send({ type: 'loadCaptions', videoId: 'A', requestId: 21, languageCode: 'en' });
+  h.emit('yt-navigate-start');
+  h.location.href = 'https://www.youtube.com/watch?v=B';
+  h.emit('yt-navigate-finish');
+  assert.equal(signal.aborted, true);
+  finish({ ok: true, text: async () => captionText });
+  await settle();
+  assert.equal(resultFor(h, 21).error, 'stale-video');
+  assert.equal(h.messages.some(message => message.type === 'capturedCaptions'), false);
+});
+
+test('caption fetch timeout aborts the request and allows a later independent retry', async () => {
+  let signal;
+  const h = harness({ initial: response('A', [track()]), fetch: (url, options) => {
+    signal = options.signal;
+    return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+  } });
+  h.send({ type: 'loadCaptions', videoId: 'A', requestId: 22, languageCode: 'en' });
+  h.tick(8000);
+  await settle();
+  assert.equal(signal.aborted, true);
+  assert.equal(resultFor(h, 22).error, 'caption-timeout');
+  h.send({ type: 'loadCaptions', videoId: 'A', requestId: 23, languageCode: 'en' });
+  assert.equal(h.data.fetchCalls, 2);
+  h.tick(8000);
+  await settle();
+});
+
+test('signed format parameters are preserved and same-language ASR/manual tracks are not mixed', async () => {
+  const asr = { ...track(), kind: 'asr', baseUrl: `${track().baseUrl}&kind=asr&fmt=srv3&sparams=v,lang,kind,fmt` };
+  const h = harness({ initial: response('A', [track(), asr]) });
+  h.send({ type: 'loadCaptions', videoId: 'A', requestId: 24, baseUrl: asr.baseUrl, languageCode: 'en' });
+  await settle();
+  const url = new URL(h.data.fetchRequests[0][0]);
+  assert.equal(url.searchParams.get('kind'), 'asr');
+  assert.equal(url.searchParams.get('fmt'), 'srv3');
+  assert.equal(resultFor(h, 24).ok, true);
 });
